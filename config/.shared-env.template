@@ -1,0 +1,54 @@
+# =============================================================================
+# Shared Environment Configuration — fill in YOUR keys here.
+# This file is gitignored. Do NOT commit real secrets.
+# =============================================================================
+
+# --- Claude / Anthropic ---
+export ANTHROPIC_API_KEY=""
+
+# --- OpenAI / Codex ---
+export OPENAI_API_KEY=""
+
+# --- Google / Gemini ---
+export GOOGLE_API_KEY=""
+export GEMINI_API_KEY=""
+
+# --- xAI / Grok ---
+export GROK_API_KEY=""
+
+# --- NGC NVIDIA ---
+export NGC_API_KEY=""
+
+# --- Baseten ---
+export BASETEN_API_KEY=""
+
+# --- Fireworks ---
+export FIREWORKS_API_KEY=""
+
+# --- Cerebras ---
+export CEREBRAS_API_KEY=""
+
+# --- Ollama ---
+export OLLAMA_API_KEY=""
+
+# --- Cloudflare ---
+export CLOUDFLARE_API_TOKEN=""
+export CLOUDFLARE_ACCOUNT_ID=""
+export CLOUDFLARE_R2_ACCESS_KEY=""
+export CLOUDFLARE_R2_SECRET_KEY=""
+export CLOUDFLARE_R2_ENDPOINT=""
+
+# --- Kilo ---
+export KILO_API_KEY=""
+
+# --- Poolside ---
+export POOLSIDE_API_KEY=""
+export POOLSIDE_EMAIL=""
+
+# --- Others ---
+export DEEPSEEK_API_KEY=""
+export MINIMAX_API_KEY=""
+export EXA_API_KEY=""
+export MIMO_API_KEY=""
+export INCEPTION_API_KEY=""
+export CHUTES_API_KEY=""
