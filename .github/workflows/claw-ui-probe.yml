@@ -5,11 +5,13 @@ on:
     branches: [main, ops/claw-control-ui-probe-20260828]
     paths:
       - scripts/probe_claw_ui.py
+      - scripts/probe_claw_browser.py
       - tests/test_probe_claw_ui.py
       - .github/workflows/claw-ui-probe.yml
   pull_request:
     paths:
       - scripts/probe_claw_ui.py
+      - scripts/probe_claw_browser.py
       - tests/test_probe_claw_ui.py
       - .github/workflows/claw-ui-probe.yml
   workflow_dispatch:
@@ -22,18 +24,25 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v6
 
-      - name: Verify the evidence probe
+      - name: Verify the HTTP evidence probe
         run: |
           set -euo pipefail
           python3 -m py_compile scripts/probe_claw_ui.py tests/test_probe_claw_ui.py
           python3 -m unittest tests.test_probe_claw_ui -v
 
-      - name: Observe the public boot surface
-        id: live
+      - name: Install pinned browser evidence runtime
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check playwright==1.55.0
+          python3 -m playwright install --with-deps chromium
+          python3 -m py_compile scripts/probe_claw_browser.py
+
+      - name: Observe HTTP, asset, and runtime-config boundaries
+        id: http
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -41,20 +50,34 @@ jobs:
           python3 scripts/probe_claw_ui.py \
             https://claw.idol.id/ \
             --timeout 20 \
-            --output artifacts/claw-ui.json
+            --output artifacts/claw-http.json
 
-      - name: Preserve exact HTTP and asset evidence
+      - name: Execute the public shell in Chromium
+        id: browser
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/probe_claw_browser.py \
+            https://claw.idol.id/ \
+            --timeout-ms 30000 \
+            --settle-ms 8000 \
+            --output artifacts/claw-browser.json \
+            --screenshot artifacts/claw-browser.png
+
+      - name: Preserve exact surface evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: claw-ui-${{ github.run_id }}
-          path: artifacts/claw-ui.json
+          path: artifacts/
           if-no-files-found: error
           retention-days: 14
 
       - name: Admit only a bootable surface
         if: always()
         env:
-          LIVE_OUTCOME: ${{ steps.live.outcome }}
+          HTTP_OUTCOME: ${{ steps.http.outcome }}
+          BROWSER_OUTCOME: ${{ steps.browser.outcome }}
         run: |
-          test "$LIVE_OUTCOME" = success
+          test "$HTTP_OUTCOME" = success
+          test "$BROWSER_OUTCOME" = success
