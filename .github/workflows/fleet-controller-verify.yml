@@ -1,0 +1,62 @@
+name: Verify fleet controller without inference
+
+on:
+  push:
+    branches: [ops/fleet-controller-v1]
+    paths:
+      - fleet_control/**
+      - tests/**
+      - scripts/idol-fleet
+      - scripts/install-fleet-observer.sh
+      - scripts/install-fleet-observer-systemd.sh
+      - config/fleet.example.json
+      - config/work-order.example.json
+      - .github/workflows/fleet-controller-verify.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: idol-fleet-controller-verify
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: [self-hosted, macOS, ARM64, mac-mini, idol-native]
+    timeout-minutes: 15
+    env:
+      IDOL_FLEET_NO_PAYGO: "1"
+      IDOL_FLEET_NO_MODEL_INFERENCE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ops/fleet-controller-v1
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Compile controller
+        run: python3 -m compileall -q fleet_control tests
+      - name: Run fail-closed controller tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Prove example routes are disabled and non-pay-go
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          raw=json.loads(Path('config/fleet.example.json').read_text())
+          assert raw['mode'] == 'observe-plan'
+          for route in raw['routes']:
+              assert route['enabled'] is False
+              assert route['billing'] in {'local', 'included'}
+              assert route['proof']['trusted'] is False
+          print('example configuration is inert until local calibration')
+          PY
+      - name: Verify installer cannot enable apply
+        run: |
+          grep -F -- '--mode observe-plan' scripts/install-fleet-observer.sh
+          grep -F -- '--mode observe-plan' scripts/install-fleet-observer-systemd.sh
+          if grep -R -nE 'usage reset|top.?up|paygo_approved[^[:space:]]*true|billing[^[:space:]]*[=:][^[:space:]]*paygo' fleet_control scripts/install-fleet-observer*.sh; then
+            echo 'forbidden automatic spending surface found' >&2
+            exit 1
+          fi
