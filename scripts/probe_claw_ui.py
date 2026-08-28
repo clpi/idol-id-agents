@@ -62,7 +62,9 @@ class BootAssetParser(HTMLParser):
         self.base_url = base_url
         self.assets: list[AssetRef] = []
 
-    def handle_tag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
         values = {key.lower(): value for key, value in attrs}
         if tag.lower() == "script" and values.get("src"):
             self.assets.append(
