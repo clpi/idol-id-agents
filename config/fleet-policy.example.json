@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "mode": "observe-plan",
+  "trusted_billing_proofs": [
+    "local-runtime",
+    "native-subscription"
+  ],
+  "routes": [
+    {
+      "id": "ollama-local-observer",
+      "provider": "ollama",
+      "model": "ollama/REPLACE_WITH_LOCAL_MODEL",
+      "runtime": "openclaw",
+      "billing": "local",
+      "proof": "local-runtime",
+      "roles": ["observer", "evidence", "mechanic"],
+      "max_concurrency": 1,
+      "fallbacks": [],
+      "config_path": "REPLACE_WITH_PRIVATE_LOCAL_CONFIG_PATH"
+    },
+    {
+      "id": "codex-subscription",
+      "provider": "openai",
+      "model": "openai/gpt-5.6-sol",
+      "runtime": "openclaw-codex",
+      "billing": "included",
+      "proof": "native-subscription",
+      "roles": ["architect", "implementer", "reviewer"],
+      "max_concurrency": 1,
+      "fallbacks": [],
+      "provider_family": "openai",
+      "config_path": "REPLACE_WITH_PRIVATE_CODEX_SUBSCRIPTION_CONFIG_PATH"
+    }
+  ],
+  "limits": {
+    "global_editing": 1,
+    "global_observer": 4
+  }
+}

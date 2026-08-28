@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.idol.fleet</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@PYTHON@@</string>
+    <string>-m</string>
+    <string>idol_fleet</string>
+    <string>daemon</string>
+    <string>--policy</string>
+    <string>@@POLICY@@</string>
+    <string>--tasks</string>
+    <string>@@TASKS@@</string>
+    <string>--state</string>
+    <string>@@STATE@@</string>
+    <string>--repository</string>
+    <string>@@IDOL_REPOSITORY@@</string>
+    <string>--interval</string>
+    <string>300</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@@LOG@@</string>
+  <key>StandardErrorPath</key>
+  <string>@@ERROR_LOG@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>IDOL_FLEET_MODE</key>
+    <string>observe-plan</string>
+  </dict>
+</dict>
+</plist>

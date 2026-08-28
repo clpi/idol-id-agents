@@ -1,0 +1,15 @@
+[
+  {
+    "id": "observe-current-claims",
+    "role": "observer",
+    "priority": 100,
+    "criticality": 100,
+    "estimated_seconds": 60,
+    "ready": true,
+    "semantic_targets": ["live.claims"],
+    "path_targets": [],
+    "resident_routes": ["ollama-local-observer"],
+    "risk": "low",
+    "review_required": false
+  }
+]
