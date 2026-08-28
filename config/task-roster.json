@@ -1,0 +1,157 @@
+{
+  "repository": "clpi/idol",
+  "tasks": [
+    {
+      "id": "idol-197-token-observation",
+      "issue": 197,
+      "state": "architecture_ready",
+      "priority": "P0",
+      "architecture_required": true,
+      "required_role": "architect",
+      "minimum_quality": 0.92,
+      "estimate_minutes": 90,
+      "paths": [
+        "lib/compiler/token_view.id",
+        "lib/compiler/parser.id",
+        "gate/gap-145-consumer.sh"
+      ],
+      "semantic_boundaries": ["token-identity-observation", "grammar-consumer"],
+      "stop_conditions": [
+        "multiple lawful semantic relations remain",
+        "a new module-scope vocabulary item would be required",
+        "the repair would reconstruct identity from spelling or a host token tag"
+      ],
+      "evidence": [
+        "changed-Idol namespace-first negative control",
+        "no return to lexer.peek(lx).kind",
+        "parser differential on exact integrated SHA",
+        "GAP-145 consumer gate"
+      ]
+    },
+    {
+      "id": "idol-195-process-world",
+      "issue": 195,
+      "state": "architecture_ready",
+      "priority": "P0",
+      "architecture_required": true,
+      "required_role": "architect",
+      "minimum_quality": 0.94,
+      "estimate_minutes": 120,
+      "paths": [
+        "docs/spec/world.md",
+        "lib/tar.id",
+        "lib/compiler/emit_c.id",
+        "src/sema.zig",
+        "src/codegen.zig"
+      ],
+      "semantic_boundaries": ["process-world", "command-run", "process-capture"],
+      "stop_conditions": [
+        "authority would be inferred from a namespace or spelling",
+        "success failure or absent capture would be represented by a sentinel",
+        "the proposed relation lacks a world witness or exact result law"
+      ],
+      "evidence": [
+        "executed success and failure outcomes by value",
+        "capture absence refuses instead of becoming empty text",
+        "direct proc.exec os.execute and shell-string authority negative controls",
+        "world authority negative control"
+      ]
+    },
+    {
+      "id": "idol-201-byte-realization",
+      "issue": 201,
+      "state": "architecture_ready",
+      "priority": "P0",
+      "architecture_required": true,
+      "required_role": "architect",
+      "minimum_quality": 0.92,
+      "estimate_minutes": 90,
+      "paths": ["src/codegen.zig", "gate/gap-145-consumer.sh"],
+      "semantic_boundaries": ["quoted-byte-realization", "representation-one"],
+      "stop_conditions": [
+        "a byte sequence would become nil text or another semantic value",
+        "a second quote or byte taxonomy would be introduced",
+        "the generic emitter cannot state an exact refusal boundary"
+      ],
+      "evidence": [
+        "boxed and full-native byte-sequence fixtures",
+        "no-runtime artifact contains no lua_val_nil reference",
+        "by-value preservation or exact refusal",
+        "deliberate representation mismatch control"
+      ]
+    },
+    {
+      "id": "idol-202-poison-classifier",
+      "issue": 202,
+      "state": "implementation_ready",
+      "priority": "P1",
+      "required_role": "implementer",
+      "minimum_quality": 0.68,
+      "estimate_minutes": 45,
+      "paths": ["src/poison.zig", "gate/gap-145-consumer.sh"],
+      "semantic_boundaries": ["poison-text-classifier", "evidence-instrument"],
+      "stop_conditions": [
+        "the semantic graph would be imported into the AST damage tool",
+        "a second quote classifier would be created",
+        "the control can pass on zero text or byte subjects"
+      ],
+      "evidence": [
+        "positive text mutation control",
+        "byte-sequence non-mutation control",
+        "classifier sabotage control",
+        "live population is counted only by the runner"
+      ]
+    },
+    {
+      "id": "idol-203-linux-target-matrix",
+      "issue": 203,
+      "state": "architecture_ready",
+      "priority": "P0",
+      "architecture_required": true,
+      "required_role": "architect",
+      "minimum_quality": 0.94,
+      "estimate_minutes": 180,
+      "paths": ["src/native_backend.zig", "src/main.zig"],
+      "semantic_boundaries": ["target-tuple", "elf-object", "arm64-relocation", "native-admission"],
+      "stop_conditions": [
+        "OS support is being inferred from symbol spelling alone",
+        "x86_64 would enter an AArch64 emitter",
+        "object format or relocation evidence cannot be executed on an exact toolchain"
+      ],
+      "evidence": [
+        "closed supported target tuple table",
+        "ELF assembler link and readelf artifact evidence",
+        "AArch64 execution by value or explicit unmeasured status",
+        "Mach-O unchanged control",
+        "unsupported architecture refusal controls"
+      ]
+    },
+    {
+      "id": "idol-204-comment-projection",
+      "issue": 204,
+      "state": "implementation_ready",
+      "priority": "P1",
+      "required_role": "implementer",
+      "minimum_quality": 0.76,
+      "estimate_minutes": 60,
+      "paths": [
+        "scripts/treesitter_emit.id",
+        "gate/gap-145-consumer.sh",
+        "gaps/GAP-134.md",
+        "gaps/GAP-145.md"
+      ],
+      "semantic_boundaries": ["grammar-comment-projection", "grammar-owner"],
+      "stop_conditions": [
+        "a subject plus relation is glued into one binding",
+        "comment spellings are typed beside the owner",
+        "volatile census totals would be copied into prose"
+      ],
+      "evidence": [
+        "typed spelling reversion fails",
+        "bridge read plus typed emission fails",
+        "owner spelling damage changes or refuses projection",
+        "tracked grammar remains byte-identical when owner facts are unchanged"
+      ]
+    }
+  ]
+}
