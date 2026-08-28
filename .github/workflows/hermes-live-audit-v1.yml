@@ -1,0 +1,129 @@
+name: Hermes sanitized live audit v1
+
+on:
+  push:
+    branches:
+      - openclaw/browser-probe-20260828
+    paths:
+      - .github/workflows/hermes-live-audit-v1.yml
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish ephemeral transport key
+        id: key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          umask 077
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /tmp/transport-private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/transport-private.pem -pubout -out /tmp/transport-public.pem >/dev/null 2>&1
+          public_b64="$(base64 -w0 /tmp/transport-public.pem)"
+          body="$(printf 'IDOL_HERMES_KEY:%s\n%s' "$run_key" "$public_b64")"
+          jq -n --arg body "$body" '{body:$body}' >/tmp/key-comment.json
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/1/comments" \
+            --data-binary @/tmp/key-comment.json >/dev/null
+          echo "run_key=$run_key" >>"$GITHUB_OUTPUT"
+
+      - name: Receive encrypted Hermes password
+        id: receive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_KEY: ${{ steps.key.outputs.run_key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cipher=""
+          for _ in $(seq 1 240); do
+            curl -fsS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/1/comments?per_page=100" \
+              >/tmp/comments.json
+            cipher="$(python3 - "$RUN_KEY" /tmp/comments.json <<'PY'
+          import json, sys
+          key, path = sys.argv[1], sys.argv[2]
+          marker = f"IDOL_HERMES_CIPHERTEXT:{key}"
+          for comment in reversed(json.load(open(path))):
+              body = comment.get("body") or ""
+              if body.startswith(marker):
+                  rest = body[len(marker):]
+                  if rest.startswith("\\n"): rest = rest[2:]
+                  elif rest.startswith("\n"): rest = rest[1:]
+                  print(rest.strip())
+                  break
+          PY
+            )"
+            if [ -n "$cipher" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$cipher" ]; then
+            printf '%s\n' '{"schema":"idol.hermes.live-audit.v1","outcome":"ciphertext-timeout"}' >hermes-audit.json
+            echo "received=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s' "$cipher" | base64 -d >/tmp/hermes-cipher.bin
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/transport-private.pem \
+            -in /tmp/hermes-cipher.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -out /tmp/idol-hermes-password
+          password="$(cat /tmp/idol-hermes-password)"
+          echo "::add-mask::$password"
+          unset password cipher
+          echo "received=true" >>"$GITHUB_OUTPUT"
+
+      - name: Install Playwright Chromium
+        if: steps.receive.outputs.received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/idol-hermes-node
+          cd /tmp/idol-hermes-node
+          npm init -y >/dev/null 2>&1
+          npm install --silent playwright@1.55.0
+          npx playwright install --with-deps chromium >/dev/null
+          cp "$GITHUB_WORKSPACE/scripts/hermes-live-audit-v1.mjs" ./audit.mjs
+
+      - name: Run sanitized live audit
+        if: steps.receive.outputs.received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/idol-hermes-node
+          HERMES_PASSWORD_FILE=/tmp/idol-hermes-password \
+          HERMES_RESULT_FILE="$GITHUB_WORKSPACE/hermes-audit.json" \
+            node audit.mjs
+
+      - name: Upload sanitized audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-live-audit-${{ steps.key.outputs.run_key }}
+          path: hermes-audit.json
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Destroy plaintext and transient keys
+        if: always()
+        shell: bash
+        run: |
+          rm -f /tmp/transport-private.pem /tmp/transport-public.pem /tmp/key-comment.json \
+            /tmp/hermes-cipher.bin /tmp/idol-hermes-password /tmp/comments.json
