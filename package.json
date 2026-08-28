@@ -7,7 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node scripts/hermes-openclaw-bridge.mjs"
+    "start": "node scripts/hermes-openclaw-launch.mjs"
   },
   "dependencies": {
     "ws": "^8.18.3"
