@@ -21,6 +21,8 @@ from typing import Any
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
+from claw_evidence_policy import expected_request_failure
+
 UTC = dt.timezone.utc
 FALLBACK_MARKERS = (
     "Control UI did not start",
@@ -42,6 +44,10 @@ def scrub(value: object, limit: int = 4000) -> str:
 def path_of(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     return urllib.parse.urlunsplit(("", "", parsed.path, parsed.query, "")) or "/"
+
+
+def host_of(url: str) -> str:
+    return (urllib.parse.urlsplit(url).hostname or "").lower()
 
 
 def body_digest(text: str) -> str:
@@ -146,6 +152,7 @@ async def probe(
             failed_requests.append(
                 {
                     "method": request.method,
+                    "host": host_of(request.url),
                     "path": path_of(request.url),
                     "resource": request.resource_type,
                     "failure": scrub(request.failure or "unknown"),
@@ -196,6 +203,8 @@ async def probe(
             await browser.close()
 
     visible_fallback = bool(inspected.get("fallback"))
+    expected_failed_requests = [item for item in failed_requests if expected_request_failure(item)]
+    unexpected_failed_requests = [item for item in failed_requests if not expected_request_failure(item)]
     errors: list[str] = []
     if navigation_status != 200:
         errors.append(f"navigation-status:{navigation_status}")
@@ -205,8 +214,8 @@ async def probe(
         errors.append("fallback-shell-visible")
     if page_errors:
         errors.append(f"page-errors:{len(page_errors)}")
-    if failed_requests:
-        errors.append(f"failed-requests:{len(failed_requests)}")
+    if unexpected_failed_requests:
+        errors.append(f"failed-requests:{len(unexpected_failed_requests)}")
 
     # A protected runtime-config response is expected before authentication and
     # must not itself fail the public boot shell.
@@ -234,6 +243,8 @@ async def probe(
         "console": consoles,
         "page_errors": page_errors,
         "failed_requests": failed_requests,
+        "expected_failed_requests": expected_failed_requests,
+        "unexpected_failed_requests": unexpected_failed_requests,
         "error_responses": error_responses,
         "unexpected_error_responses": unexpected_responses,
         "errors": errors,

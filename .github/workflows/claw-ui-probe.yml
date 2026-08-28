@@ -6,16 +6,20 @@ on:
     paths:
       - scripts/probe_claw_ui.py
       - scripts/probe_claw_browser.py
+      - scripts/claw_evidence_policy.py
       - scripts/audit_openclaw_package.py
       - tests/test_probe_claw_ui.py
+      - tests/test_claw_evidence_policy.py
       - tests/test_audit_openclaw_package.py
       - .github/workflows/claw-ui-probe.yml
   pull_request:
     paths:
       - scripts/probe_claw_ui.py
       - scripts/probe_claw_browser.py
+      - scripts/claw_evidence_policy.py
       - scripts/audit_openclaw_package.py
       - tests/test_probe_claw_ui.py
+      - tests/test_claw_evidence_policy.py
       - tests/test_audit_openclaw_package.py
       - .github/workflows/claw-ui-probe.yml
   workflow_dispatch:
@@ -32,13 +36,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Verify HTTP and package evidence logic
+      - name: Verify HTTP, package, and browser evidence logic
         run: |
           set -euo pipefail
           python3 -m py_compile \
             scripts/probe_claw_ui.py \
+            scripts/claw_evidence_policy.py \
             scripts/audit_openclaw_package.py \
             tests/test_probe_claw_ui.py \
+            tests/test_claw_evidence_policy.py \
             tests/test_audit_openclaw_package.py
           python3 -m unittest discover -s tests -v
 
