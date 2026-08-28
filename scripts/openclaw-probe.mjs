@@ -4,15 +4,16 @@ import WebSocket from "ws";
 
 const gatewayUrl = process.env.OPENCLAW_GATEWAY_URL;
 const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
-const bootstrapToken = process.env.OPENCLAW_BOOTSTRAP_TOKEN;
+const deviceSeedHex = process.env.OPENCLAW_DEVICE_SEED;
+const deviceToken = process.env.OPENCLAW_DEVICE_TOKEN;
 const timeoutMs = Number(process.env.OPENCLAW_PROBE_TIMEOUT_MS ?? 120_000);
 
-if (!gatewayUrl || (!gatewayToken && !bootstrapToken)) {
+if (!gatewayUrl || !gatewayToken || !deviceSeedHex) {
   console.error("IDOL_OPENCLAW_PROBE_ERROR=missing-required-environment");
   process.exit(2);
 }
 
-const sensitiveKey = /(token|password|secret|credential|cookie|authorization|api.?key|private.?key|public.?key|bootstrap|signature|recoveryScope)/i;
+const sensitiveKey = /(token|password|secret|credential|cookie|authorization|api.?key|private.?key|public.?key|bootstrap|signature|recoveryScope|seed)/i;
 const contentKey = /(message|messages|content|text|prompt|transcript|preview|history|summary|reasoning)/i;
 const pathKey = /(^|_)(path|cwd|dir|root|home|workspace)(_|$)|repoRoot|stateDir/i;
 
@@ -72,7 +73,7 @@ class GatewayRpcError extends Error {
 const ws = new WebSocket(gatewayUrl, {
   handshakeTimeout: 20_000,
   perMessageDeflate: false,
-  headers: { "User-Agent": "idol-openclaw-probe/0.2" },
+  headers: { "User-Agent": "idol-openclaw-probe/0.3" },
 });
 
 let requestNumber = 0;
@@ -158,8 +159,24 @@ async function withDeadline(promise, ms, label) {
   }
 }
 
+function keyPairFromSeed(hex) {
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error("invalid-device-seed");
+  }
+  const seed = Buffer.from(hex, "hex");
+  // RFC 8410 PKCS#8 wrapper for a raw 32-byte Ed25519 private seed.
+  const prefix = Buffer.from("302e020100300506032b657004220420", "hex");
+  const privateKey = crypto.createPrivateKey({
+    key: Buffer.concat([prefix, seed]),
+    format: "der",
+    type: "pkcs8",
+  });
+  const publicKey = crypto.createPublicKey(privateKey);
+  return { privateKey, publicKey };
+}
+
 function createDeviceProof(params) {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519");
+  const { privateKey, publicKey } = keyPairFromSeed(deviceSeedHex);
   const publicJwk = publicKey.export({ format: "jwk" });
   if (publicJwk.kty !== "OKP" || publicJwk.crv !== "Ed25519" || !publicJwk.x) {
     throw new Error("unexpected-ed25519-public-key-shape");
@@ -174,7 +191,7 @@ function createDeviceProof(params) {
     params.role,
     params.scopes.join(","),
     String(params.signedAt),
-    params.authMaterial ?? "",
+    params.signatureToken ?? "",
     params.nonce,
   ].join("|");
   const signature = crypto.sign(null, Buffer.from(signaturePayload, "utf8"), privateKey);
@@ -213,64 +230,71 @@ async function main() {
   const clientId = "gateway-client";
   const clientMode = "backend";
   const role = "operator";
-  const bootstrapScopes = [
-    "operator.admin",
-    "operator.approvals",
-    "operator.questions",
-    "operator.read",
-    "operator.talk.secrets",
-    "operator.write",
-  ];
-  const tokenScopes = ["operator.read"];
-  const scopes = bootstrapToken ? bootstrapScopes : tokenScopes;
+  const scopes = ["operator.read"];
   const connectChallenge = await withDeadline(challenge, 10_000, "connect-challenge");
   const nonce = typeof connectChallenge?.nonce === "string" ? connectChallenge.nonce : "";
   const signedAt = Number(connectChallenge?.ts);
   if (!nonce || !Number.isSafeInteger(signedAt) || signedAt < 0) {
     throw new Error("invalid-connect-challenge");
   }
-  const authMaterial = bootstrapToken ?? gatewayToken;
-  const device = bootstrapToken
-    ? createDeviceProof({
-        clientId,
-        clientMode,
-        role,
-        scopes,
-        signedAt,
-        nonce,
-        authMaterial,
-      })
-    : undefined;
 
-  const hello = await call("connect", {
-    minProtocol: 4,
-    maxProtocol: 4,
-    client: {
-      id: clientId,
-      version: "0.2.0",
-      platform: "linux",
-      mode: clientMode,
-      displayName: "Idol authority probe",
-    },
+  const activeCredential = deviceToken || gatewayToken;
+  const device = createDeviceProof({
+    clientId,
+    clientMode,
     role,
     scopes,
-    caps: ["tool-events", "session-scoped-events", "usage-refreshing"],
-    commands: [],
-    permissions: {},
-    auth: bootstrapToken ? { bootstrapToken } : { token: gatewayToken },
-    ...(device ? { device } : {}),
-    locale: "en-US",
-    userAgent: "idol-openclaw-probe/0.2",
-  }, 60_000);
+    signedAt,
+    nonce,
+    signatureToken: activeCredential,
+  });
+
+  let hello;
+  try {
+    hello = await call("connect", {
+      minProtocol: 4,
+      maxProtocol: 4,
+      client: {
+        id: clientId,
+        version: "0.3.0",
+        platform: "linux",
+        mode: clientMode,
+        displayName: "Idol authority probe",
+      },
+      role,
+      scopes,
+      caps: ["tool-events", "session-scoped-events", "usage-refreshing"],
+      commands: [],
+      permissions: {},
+      auth: deviceToken
+        ? { token: deviceToken, deviceToken }
+        : { token: gatewayToken },
+      device,
+      locale: "en-US",
+      userAgent: "idol-openclaw-probe/0.3",
+    }, 60_000);
+  } catch (error) {
+    const detail = error instanceof GatewayRpcError
+      ? rpcErrorSummary(error.rpcError)
+      : { message: sanitize(String(error?.message ?? error)) };
+    console.error(`IDOL_OPENCLAW_PAIRING=${JSON.stringify({
+      schema: "idol.openclaw.pairing.v1",
+      deviceId: device.id,
+      requestedScopes: scopes,
+      outcome: detail,
+    })}`);
+    throw error;
+  }
 
   const advertised = new Set(
     Array.isArray(hello?.features?.methods) ? hello.features.methods : [],
   );
 
   const report = {
-    schema: "idol.openclaw.probe.v2",
+    schema: "idol.openclaw.probe.v3",
     observedAt: new Date().toISOString(),
-    authMode: bootstrapToken ? "signed-bootstrap-device" : "shared-token",
+    authMode: deviceToken ? "device-token" : "signed-shared-token",
+    deviceId: device.id,
     gateway: sanitize({
       protocol: hello?.protocol,
       server: hello?.server,
@@ -291,7 +315,6 @@ async function main() {
     ["status", {}, 45_000],
     ["system.info", {}, 45_000],
     ["system-presence", {}, 45_000],
-    ["users.self", {}, 45_000],
     ["agents.list", {}, 60_000],
     ["models.list", {}, 90_000],
     ["models.authStatus", {}, 90_000],
@@ -317,7 +340,7 @@ async function main() {
     [...eventCounts.entries()].sort(([a], [b]) => a.localeCompare(b)),
   );
 
-  console.log(`IDOL_OPENCLAW_PROBE_V2=${JSON.stringify(report)}`);
+  console.log(`IDOL_OPENCLAW_PROBE_V3=${JSON.stringify(report)}`);
   ws.close(1000, "probe-complete");
 }
 
