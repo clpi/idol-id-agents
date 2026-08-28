@@ -5,6 +5,7 @@ on:
     branches: [ops/hermes-byte-refusal-201]
     paths:
       - scripts/hermes-byte-refusal-201.mjs
+      - scripts/byte-refusal-201.sh
       - .github/workflows/hermes-byte-refusal-201.yml
   workflow_dispatch:
 
@@ -19,7 +20,7 @@ concurrency:
 jobs:
   submit-fixed-repair:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     env:
       MAILBOX_ISSUE: "6"
       HERMES_URL: "https://hermes.idol.id"
@@ -34,20 +35,11 @@ jobs:
           test -n "$chrome"
           echo "CHROME_BIN=$chrome" >> "$GITHUB_ENV"
 
-      - name: Adapt transient Hermes lexical globals and verify syntax
+      - name: Verify fixed transport and shell syntax
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('scripts/hermes-byte-refusal-201.mjs')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace('window.api', 'api')
-          text = text.replace('window.S', 'S')
-          text = text.replace('window.newSession', 'newSession')
-          text = text.replace('${TMPDIR:-/tmp}', '/tmp')
-          path.write_text(text, encoding='utf-8')
-          PY
           node --check scripts/hermes-byte-refusal-201.mjs
+          sh -n scripts/byte-refusal-201.sh
 
       - name: Decrypt Hermes credential in memory and submit the fixed repair
         env:
