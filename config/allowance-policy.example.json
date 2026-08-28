@@ -1,0 +1,121 @@
+{
+  "schema": "idol.allowance.input.v1",
+  "observed_at": "2026-08-28T05:00:00Z",
+  "current_sha": "cb2199dff026c1b2d3fbd0caa04d6d323370a9e8",
+  "paygo_approved": false,
+  "providers": [
+    {
+      "id": "local-observer",
+      "provider": "ollama",
+      "family": "local-glm",
+      "model": "exact-model-required",
+      "cost_class": "local",
+      "enabled": true,
+      "premium": false,
+      "max_parallel": 2,
+      "quality": {
+        "observer": 0.82,
+        "census": 0.88,
+        "implementation": 0.45,
+        "architecture": 0.2,
+        "default": 0.4
+      },
+      "windows": []
+    },
+    {
+      "id": "codex-subscription",
+      "provider": "openai-codex",
+      "family": "openai",
+      "model": "exact-model-required",
+      "cost_class": "expiring_included",
+      "enabled": true,
+      "premium": true,
+      "max_parallel": 1,
+      "quality": {
+        "architecture": 0.95,
+        "review": 0.98,
+        "implementation": 0.86,
+        "default": 0.75
+      },
+      "windows": [
+        {
+          "name": "weekly",
+          "remaining_tokens": 500000,
+          "remaining_percent": 60,
+          "reset_at": "2026-09-01T05:00:00Z",
+          "period_seconds": 604800,
+          "source": "example-not-live"
+        }
+      ]
+    },
+    {
+      "id": "generic-paygo",
+      "provider": "example",
+      "family": "example",
+      "model": "example",
+      "cost_class": "paygo",
+      "enabled": true,
+      "premium": false,
+      "max_parallel": 4,
+      "quality": {"default": 0.8},
+      "windows": [
+        {
+          "name": "balance",
+          "remaining_tokens": 1000000,
+          "source": "example-not-live"
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "P0-A-architecture",
+      "state": "productive_ready",
+      "blocked": false,
+      "base_sha": "cb2199dff026c1b2d3fbd0caa04d6d323370a9e8",
+      "role": "architecture",
+      "value": 100,
+      "priority_weight": 2,
+      "premium_required": true,
+      "estimated_input_tokens": 45000,
+      "estimated_output_tokens": 12000,
+      "estimated_minutes": 90,
+      "completion_probability": 0.8,
+      "evidence_factor": 1.2,
+      "minimum_role_fit": 0.9,
+      "review_required": true,
+      "evidence_path": "clpi/idol#197",
+      "stop_conditions": [
+        "HEAD changed",
+        "multiple lawful relations",
+        "missing producer"
+      ],
+      "paths": [
+        "lib/compiler/parser.id",
+        "lib/compiler/token_view.id"
+      ],
+      "semantic_boundaries": ["token-current-identity"]
+    },
+    {
+      "id": "P0-B-observer",
+      "state": "productive_ready",
+      "blocked": false,
+      "base_sha": "cb2199dff026c1b2d3fbd0caa04d6d323370a9e8",
+      "role": "observer",
+      "value": 65,
+      "premium_required": false,
+      "estimated_tokens": 16000,
+      "estimated_minutes": 35,
+      "completion_probability": 0.95,
+      "evidence_factor": 1.25,
+      "review_required": false,
+      "evidence_path": "clpi/idol#195",
+      "stop_conditions": [
+        "current inversion absent",
+        "fixture requires semantic edit"
+      ],
+      "paths": ["lib/tar.id"],
+      "semantic_boundaries": ["process-outcome"]
+    }
+  ]
+}
