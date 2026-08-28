@@ -1,0 +1,104 @@
+name: Probe Claw control UI
+
+on:
+  push:
+    branches: [main, ops/claw-control-ui-probe-20260828]
+    paths:
+      - scripts/probe_claw_ui.py
+      - scripts/probe_claw_browser.py
+      - scripts/audit_openclaw_package.py
+      - tests/test_probe_claw_ui.py
+      - tests/test_audit_openclaw_package.py
+      - .github/workflows/claw-ui-probe.yml
+  pull_request:
+    paths:
+      - scripts/probe_claw_ui.py
+      - scripts/probe_claw_browser.py
+      - scripts/audit_openclaw_package.py
+      - tests/test_probe_claw_ui.py
+      - tests/test_audit_openclaw_package.py
+      - .github/workflows/claw-ui-probe.yml
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify HTTP and package evidence logic
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/probe_claw_ui.py \
+            scripts/audit_openclaw_package.py \
+            tests/test_probe_claw_ui.py \
+            tests/test_audit_openclaw_package.py
+          python3 -m unittest discover -s tests -v
+
+      - name: Install pinned browser evidence runtime
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check playwright==1.55.0
+          python3 -m playwright install --with-deps chromium
+          python3 -m py_compile scripts/probe_claw_browser.py
+
+      - name: Observe HTTP, asset, and runtime-config boundaries
+        id: http
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python3 scripts/probe_claw_ui.py \
+            https://claw.idol.id/ \
+            --timeout 20 \
+            --output artifacts/claw-http.json
+
+      - name: Compare live assets with signed OpenClaw package
+        id: package
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/audit_openclaw_package.py \
+            --package openclaw \
+            --version 2026.8.1-beta.3 \
+            --live-url https://claw.idol.id/ \
+            --output artifacts/openclaw-package.json
+
+      - name: Execute the public shell in Chromium
+        id: browser
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/probe_claw_browser.py \
+            https://claw.idol.id/ \
+            --timeout-ms 30000 \
+            --settle-ms 8000 \
+            --output artifacts/claw-browser.json \
+            --screenshot artifacts/claw-browser.png
+
+      - name: Preserve exact surface evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claw-ui-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Admit only a coherent, bootable surface
+        if: always()
+        env:
+          HTTP_OUTCOME: ${{ steps.http.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
+          BROWSER_OUTCOME: ${{ steps.browser.outcome }}
+        run: |
+          test "$HTTP_OUTCOME" = success
+          test "$PACKAGE_OUTCOME" = success
+          test "$BROWSER_OUTCOME" = success
