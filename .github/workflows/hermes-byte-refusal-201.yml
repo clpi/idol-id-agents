@@ -1,0 +1,105 @@
+name: Guarded byte-emitter repair
+
+on:
+  push:
+    branches: [ops/hermes-byte-refusal-201]
+    paths:
+      - scripts/hermes-byte-refusal-201.mjs
+      - .github/workflows/hermes-byte-refusal-201.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: hermes-byte-refusal-201
+  cancel-in-progress: false
+
+jobs:
+  submit-fixed-repair:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      MAILBOX_ISSUE: "6"
+      HERMES_URL: "https://hermes.idol.id"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned browser client
+        run: |
+          set -euo pipefail
+          npm install --no-save --ignore-scripts playwright-core@1.55.0 >/dev/null
+          chrome="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
+          test -n "$chrome"
+          echo "CHROME_BIN=$chrome" >> "$GITHUB_ENV"
+
+      - name: Adapt transient Hermes lexical globals and verify syntax
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/hermes-byte-refusal-201.mjs')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace('window.api', 'api')
+          text = text.replace('window.S', 'S')
+          text = text.replace('window.newSession', 'newSession')
+          text = text.replace('${TMPDIR:-/tmp}', '/tmp')
+          path.write_text(text, encoding='utf-8')
+          PY
+          node --check scripts/hermes-byte-refusal-201.mjs
+
+      - name: Decrypt Hermes credential in memory and submit the fixed repair
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cleanup() {
+            rm -f probe-private.pem probe-public.pem envelope.bin envelope.json
+          }
+          trap cleanup EXIT INT TERM
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out probe-private.pem 2>/dev/null
+          openssl pkey -in probe-private.pem -pubout -out probe-public.pem 2>/dev/null
+          public_key_b64="$(base64 -w0 probe-public.pem)"
+          comment="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${MAILBOX_ISSUE}/comments" \
+            -f "body=IDOL_TERMINAL_PUBLIC_KEY_V2=${public_key_b64}")"
+          public_id="$(printf '%s' "$comment" | jq -r '.id')"
+          echo "IDOL_REPAIR_201_PUBLIC_KEY_PUBLISHED"
+
+          ciphertext=""
+          for _ in $(seq 1 120); do
+            ciphertext="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${MAILBOX_ISSUE}/comments" \
+              --jq ".[] | select(.id > ${public_id}) | .body" 2>/dev/null \
+              | sed -n 's/^IDOL_TERMINAL_ENVELOPE_V2=//p' \
+              | tail -n 1)"
+            if [ -n "$ciphertext" ]; then
+              break
+            fi
+            sleep 3
+          done
+          test -n "$ciphertext"
+
+          printf '%s' "$ciphertext" | base64 -d > envelope.bin
+          openssl pkeyutl -decrypt \
+            -inkey probe-private.pem \
+            -in envelope.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256 \
+            -out envelope.json
+
+          hermes_password="$(jq -r '.hermesPassword // empty' envelope.json)"
+          test -n "$hermes_password"
+          echo "::add-mask::$hermes_password"
+          export HERMES_PASSWORD="$hermes_password"
+          unset ciphertext public_key_b64 hermes_password comment
+
+          node scripts/hermes-byte-refusal-201.mjs
+
+      - name: State the evidence boundary
+        if: always()
+        run: |
+          echo 'Terminal submission is not semantic success evidence.'
+          echo 'The pushed private-repository branch, exact diff, and repository gates remain authoritative.'
