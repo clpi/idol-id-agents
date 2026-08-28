@@ -1,0 +1,38 @@
+{
+  "anthropic": {
+    "cost_class": "included",
+    "enabled": true,
+    "family": "anthropic",
+    "max_concurrency": 2,
+    "premium": true,
+    "quality": 0.96,
+    "roles": ["architect", "implementer", "reviewer"]
+  },
+  "openai-codex": {
+    "cost_class": "included",
+    "enabled": true,
+    "family": "openai",
+    "max_concurrency": 2,
+    "premium": true,
+    "quality": 0.97,
+    "roles": ["architect", "implementer", "reviewer"]
+  },
+  "ollama": {
+    "cost_class": "included",
+    "enabled": true,
+    "family": "ollama",
+    "max_concurrency": 3,
+    "premium": false,
+    "quality": 0.68,
+    "roles": ["observer", "counterexample", "evidence", "mechanic"]
+  },
+  "openrouter": {
+    "cost_class": "purchased_credit",
+    "enabled": false,
+    "family": "openrouter",
+    "max_concurrency": 0,
+    "premium": false,
+    "quality": 0.0,
+    "roles": []
+  }
+}
