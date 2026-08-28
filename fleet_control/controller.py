@@ -1,0 +1,535 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import time
+from typing import Any, Mapping, Sequence
+
+from .calibration import apply_calibration, config_hash, load_calibration
+from .claims import ControllerLease, RepositoryClaimTransaction, SemanticClaimStore
+from .gitops import (
+    GitRefusal,
+    commit_claimed,
+    create_draft_pull_request,
+    create_worktree,
+    current_sha,
+    is_dirty,
+    publish_branch,
+    require_claimed_changes,
+    require_exact_subject,
+)
+from .journal import Journal
+from .model import Assignment, Route, WorkOrder, load_routes, mapping, sequence, stable_hash
+from .policy import assert_order_route
+from .runtime import CommandRuntime, RuntimeRefusal
+from .scheduler import Plan, Rejection, build_plan
+
+
+class ControllerError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ControllerConfig:
+    mode: str
+    repository: Path
+    state_dir: Path
+    work_orders_dir: Path
+    calibration_file: Path
+    interval_seconds: int
+    max_assignments: int
+    claim_ttl_seconds: int
+    witness_timeout_seconds: int
+    base_branch: str
+    author_name: str
+    author_email: str
+    routes: tuple[Route, ...]
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"observe-plan", "apply"}:
+            raise ValueError("mode must be observe-plan or apply")
+        for label, path in (
+            ("repository", self.repository),
+            ("state_dir", self.state_dir),
+            ("work_orders_dir", self.work_orders_dir),
+            ("calibration_file", self.calibration_file),
+        ):
+            if not path.is_absolute():
+                raise ValueError(f"{label} must be absolute")
+        if self.interval_seconds < 15 or self.interval_seconds > 86400:
+            raise ValueError("interval_seconds outside supported bounds")
+        if self.max_assignments < 1 or self.max_assignments > 32:
+            raise ValueError("max_assignments outside supported bounds")
+        if self.claim_ttl_seconds < 60 or self.claim_ttl_seconds > 86400:
+            raise ValueError("claim_ttl_seconds outside supported bounds")
+        if self.witness_timeout_seconds < 10 or self.witness_timeout_seconds > 86400:
+            raise ValueError("witness_timeout_seconds outside supported bounds")
+        if not self.routes:
+            raise ValueError("controller requires at least one route")
+
+
+@dataclass(frozen=True, slots=True)
+class Observation:
+    at: float
+    repository: str
+    head: str
+    dirty: bool
+    work_orders: tuple[str, ...]
+    invalid_work_orders: Mapping[str, str]
+    live_semantic_claims: tuple[Mapping[str, Any], ...]
+    route_subjects: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class CycleResult:
+    mode: str
+    observation: Observation
+    plan: Plan
+    attempts: tuple[Mapping[str, Any], ...]
+
+
+def _absolute(value: Any, label: str) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{label} is required")
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    return path
+
+
+def load_config(path: Path) -> tuple[Mapping[str, Any], ControllerConfig]:
+    config_path = Path(path).expanduser()
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ControllerError(f"controller configuration is unreadable: {config_path}") from exc
+    raw = mapping(raw, "configuration")
+    routes_raw = sequence(raw.get("routes"), "routes")
+    routes = load_routes(mapping(item, "route") for item in routes_raw)
+    config = ControllerConfig(
+        mode=str(raw.get("mode", "observe-plan")),
+        repository=_absolute(raw.get("repository"), "repository"),
+        state_dir=_absolute(raw.get("state_dir"), "state_dir"),
+        work_orders_dir=_absolute(raw.get("work_orders_dir"), "work_orders_dir"),
+        calibration_file=_absolute(raw.get("calibration_file"), "calibration_file"),
+        interval_seconds=int(raw.get("interval_seconds", 60)),
+        max_assignments=int(raw.get("max_assignments", 1)),
+        claim_ttl_seconds=int(raw.get("claim_ttl_seconds", 3600)),
+        witness_timeout_seconds=int(raw.get("witness_timeout_seconds", 1800)),
+        base_branch=str(raw.get("base_branch", "main")),
+        author_name=str(raw.get("author_name", "idol-fleet-agent")),
+        author_email=str(raw.get("author_email", "noreply@idol.id")),
+        routes=routes,
+    )
+    return raw, config
+
+
+class FleetController:
+    def __init__(self, *, config_path: Path, mode_override: str | None = None) -> None:
+        self.config_path = Path(config_path).expanduser()
+        raw, config = load_config(self.config_path)
+        if mode_override is not None:
+            config = ControllerConfig(**{**asdict(config), "mode": mode_override})
+        self.raw_config = raw
+        self.config = config
+        self.config.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.config.work_orders_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.config.state_dir, 0o700)
+        os.chmod(self.config.work_orders_dir, 0o700)
+        self.journal = Journal(self.config.state_dir / "fleet-history.jsonl")
+        self.semantic_claims = SemanticClaimStore(self.config.state_dir / "claims")
+        self.runtime = CommandRuntime(self.config.state_dir / "runtime")
+        self.lease_path = self.config.state_dir / "controller.lock"
+
+    def _routes(self) -> tuple[Route, ...]:
+        if self.config.mode != "apply":
+            return self.config.routes
+        record = load_calibration(self.config.calibration_file)
+        return apply_calibration(
+            routes=self.config.routes,
+            record=record,
+            raw_config=self.raw_config,
+        )
+
+    def _load_work_orders(self) -> tuple[tuple[WorkOrder, ...], dict[str, str]]:
+        orders: list[WorkOrder] = []
+        invalid: dict[str, str] = {}
+        for path in sorted(self.config.work_orders_dir.glob("*.json")):
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                order = WorkOrder.from_mapping(mapping(raw, "work order"))
+                if order.repository.resolve() != self.config.repository.resolve():
+                    raise ValueError("work-order repository differs from controller repository")
+                orders.append(order)
+            except Exception as exc:
+                invalid[path.name] = f"{type(exc).__name__}: {exc}"
+        ids = [order.id for order in orders]
+        if len(ids) != len(set(ids)):
+            duplicates = sorted({value for value in ids if ids.count(value) > 1})
+            raise ControllerError("duplicate work-order ids: " + ", ".join(duplicates))
+        return tuple(orders), invalid
+
+    def observe(self) -> tuple[Observation, tuple[WorkOrder, ...]]:
+        if not (self.config.repository / ".git").exists():
+            raise ControllerError(f"configured repository is not a Git worktree: {self.config.repository}")
+        head = current_sha(self.config.repository)
+        orders, invalid = self._load_work_orders()
+        claims = self.semantic_claims.list()
+        observation = Observation(
+            at=time.time(),
+            repository=str(self.config.repository),
+            head=head,
+            dirty=is_dirty(self.config.repository),
+            work_orders=tuple(order.id for order in orders),
+            invalid_work_orders=invalid,
+            live_semantic_claims=tuple(asdict(claim) for claim in claims),
+            route_subjects={route.id: route.subject_hash for route in self.config.routes},
+        )
+        self.journal.append("fleet.observed", asdict(observation), at=observation.at)
+        return observation, orders
+
+    def _active_order_ids(self) -> frozenset[str]:
+        state: dict[str, bool] = {}
+        for row in self.journal.events(
+            {
+                "attempt.started",
+                "attempt.ready",
+                "attempt.refused",
+                "attempt.failed",
+                "attempt.cancelled",
+            }
+        ):
+            fact = row.get("fact")
+            if not isinstance(fact, Mapping):
+                continue
+            order_id = fact.get("order_id")
+            if not isinstance(order_id, str):
+                continue
+            state[order_id] = row.get("kind") == "attempt.started"
+        return frozenset(order_id for order_id, active in state.items() if active)
+
+    def plan(self, observation: Observation, orders: Sequence[WorkOrder], routes: Sequence[Route]) -> Plan:
+        active_ids = self._active_order_ids()
+        available = tuple(order for order in orders if order.id not in active_ids)
+        duplicate_rejections = tuple(
+            Rejection(order.id, None, ("attempt-already-active",))
+            for order in orders
+            if order.id in active_ids
+        )
+        plan = build_plan(
+            base_sha=observation.head,
+            orders=available,
+            routes=routes,
+            max_assignments=self.config.max_assignments,
+            now=observation.at,
+        )
+        if duplicate_rejections:
+            plan = Plan(
+                observed_at=plan.observed_at,
+                base_sha=plan.base_sha,
+                assignments=plan.assignments,
+                rejections=plan.rejections + duplicate_rejections,
+            )
+        self.journal.append(
+            "fleet.proposed",
+            {
+                "mode": self.config.mode,
+                "base_sha": plan.base_sha,
+                "assignments": [
+                    {
+                        "order_id": assignment.order.id,
+                        "route_id": assignment.route.id,
+                        "score": assignment.score,
+                        "reason": assignment.reason,
+                    }
+                    for assignment in plan.assignments
+                ],
+                "rejections": [asdict(rejection) for rejection in plan.rejections],
+            },
+            at=observation.at,
+        )
+        return plan
+
+    @staticmethod
+    def _authority_section(repository: Path, path: str) -> str:
+        source = repository / path
+        if not source.is_file():
+            raise ControllerError(f"authority file is absent: {path}")
+        raw = source.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        text = raw.decode("utf-8")
+        return f"\n## Authority: {path}\nSHA-256: `{digest}`\n\n```text\n{text}\n```\n"
+
+    def _prompt(self, assignment: Assignment, worktree: Path) -> Path:
+        order = assignment.order
+        route = assignment.route
+        sections = [
+            "# Bounded Idol fleet work order\n",
+            f"Work order: `{order.id}`\n",
+            f"Task: `{order.task_id}`\n",
+            f"Issue/provenance: `{order.issue or 'not-specified'}`\n",
+            f"Exact base SHA: `{order.base_sha}`\n",
+            f"Role: `{order.role}`\n",
+            f"Route identity: `{route.provider}/{route.model}` via `{route.runtime}`\n",
+            f"Required outcome: {order.required_outcome}\n",
+            "\n## Non-negotiable boundaries\n",
+            "- Treat the authority below and the checked-out exact SHA as the subject.\n",
+            "- Acquire no new path or semantic scope.\n",
+            "- Do not infer semantic identity from names, paths, source spelling, AST tags, opcodes, hashes, or physical representation.\n",
+            "- Do not restore retired host namespaces, sentinel outcomes, duplicate catalogs, or parallel semantic authorities.\n",
+            "- Stop rather than choose between multiple lawful semantic designs.\n",
+            "- Do not merge, rewrite history, clean another worktree, spend pay-go credits, redeem resets, or change provider configuration.\n",
+            f"- You may edit only: {', '.join(order.path_claims)}.\n",
+            f"- Semantic claims: {', '.join(order.semantic_claims)}.\n",
+            "\n## Stop conditions\n",
+            *[f"- {condition}\n" for condition in order.stop_conditions],
+            "\n## Required witnesses\n",
+            *[f"- `{json.dumps(command)}`\n" for command in order.witnesses],
+            "\nThe controller will independently reject any out-of-claim edit, stale base, failed witness, provider/model mismatch, or missing evidence.\n",
+        ]
+        for path in order.authority_files:
+            sections.append(self._authority_section(worktree, path))
+        prompt_dir = self.config.state_dir / "prompts"
+        prompt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path = prompt_dir / f"{order.id}-{int(time.time())}.md"
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("".join(sections))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return path
+
+    def _run_witnesses(self, order: WorkOrder, worktree: Path) -> tuple[Mapping[str, Any], ...]:
+        rows: list[Mapping[str, Any]] = []
+        for command in order.witnesses:
+            rendered = [
+                part.replace("{worktree}", str(worktree)).replace("{repository}", str(worktree))
+                for part in command
+            ]
+            started = time.time()
+            result = subprocess.run(
+                rendered,
+                cwd=worktree,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=self.config.witness_timeout_seconds,
+                check=False,
+            )
+            output = result.stdout[:1_000_000]
+            row = {
+                "command": rendered,
+                "returncode": result.returncode,
+                "started_at": started,
+                "ended_at": time.time(),
+                "output_hash": hashlib.sha256(output.encode()).hexdigest(),
+                "output_tail": output[-4000:],
+            }
+            rows.append(row)
+            self.journal.append("attempt.witnessed", {"order_id": order.id, **row})
+            if result.returncode != 0:
+                raise ControllerError(f"witness failed for {order.id}: {rendered!r}")
+        return tuple(rows)
+
+    def _pr_body(self, assignment: Assignment, commit: str, witness_rows: Sequence[Mapping[str, Any]]) -> Path:
+        order = assignment.order
+        path = self.config.state_dir / "handoffs" / f"{order.id}.md"
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        text = [
+            "## Fleet attempt handoff\n\n",
+            f"- Work order: `{order.id}`\n",
+            f"- Task: `{order.task_id}`\n",
+            f"- Base: `{order.base_sha}`\n",
+            f"- Candidate: `{commit}`\n",
+            f"- Implementer route: `{assignment.route.provider}/{assignment.route.model}`\n",
+            f"- Claimed paths: `{', '.join(order.path_claims)}`\n",
+            f"- Semantic claims: `{', '.join(order.semantic_claims)}`\n",
+            "\n### Required outcome\n\n",
+            order.required_outcome,
+            "\n\n### Witnesses\n\n",
+        ]
+        for row in witness_rows:
+            text.append(f"- `{json.dumps(row['command'])}` — exit `{row['returncode']}`, output hash `{row['output_hash']}`\n")
+        text.extend(
+            (
+                "\n### Admission boundary\n\n",
+                "This is a draft handoff, not admission. An independent reviewer from the required provider family must reach a terminal verdict, and integrated-head gates must pass. The controller never merges its own attempt.\n",
+            )
+        )
+        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("".join(text))
+            handle.flush()
+            os.fsync(handle.fileno())
+        return path
+
+    def dispatch(self, assignment: Assignment) -> Mapping[str, Any]:
+        order = assignment.order
+        route = assignment.route
+        assert_order_route(order, route)
+        require_exact_subject(self.config.repository, order.base_sha)
+        if is_dirty(self.config.repository):
+            raise ControllerError("apply refuses a dirty authority worktree")
+        owner = f"fleet:{route.id}:{order.id}"
+        attempt_id = stable_hash(
+            {
+                "order": order.id,
+                "task": order.task_id,
+                "base": order.base_sha,
+                "route": route.subject_hash,
+            }
+        )[:20]
+        worktree = self.config.state_dir / "worktrees" / attempt_id
+        fact = {
+            "attempt_id": attempt_id,
+            "order_id": order.id,
+            "task_id": order.task_id,
+            "route_id": route.id,
+            "base_sha": order.base_sha,
+            "worktree": str(worktree),
+        }
+        self.journal.append("attempt.started", fact)
+        semantic_acquired = False
+        try:
+            self.semantic_claims.acquire(
+                owner=owner,
+                task_id=order.task_id,
+                targets=order.semantic_claims,
+                ttl_seconds=self.config.claim_ttl_seconds,
+            )
+            semantic_acquired = True
+            with RepositoryClaimTransaction(
+                repository=self.config.repository,
+                owner=owner,
+                task_id=order.task_id,
+                paths=order.path_claims,
+                ttl_seconds=self.config.claim_ttl_seconds,
+            ):
+                create_worktree(
+                    repository=self.config.repository,
+                    path=worktree,
+                    branch=order.branch,
+                    base_sha=order.base_sha,
+                )
+                prompt = self._prompt(assignment, worktree)
+                result = self.runtime.execute(
+                    route=route,
+                    order=order,
+                    prompt_path=prompt,
+                    cwd=worktree,
+                )
+                self.journal.append(
+                    "attempt.executed",
+                    {
+                        **fact,
+                        "provider": result.provider,
+                        "model": result.model,
+                        "status": result.status,
+                        "session_id": result.session_id,
+                        "usage": dict(result.usage),
+                        "cost_usd": result.cost_usd,
+                        "stdout_hash": hashlib.sha256(result.stdout.encode()).hexdigest(),
+                        "stderr_hash": hashlib.sha256(result.stderr.encode()).hexdigest(),
+                    },
+                )
+                paths = require_claimed_changes(worktree, order.path_claims)
+                witness_rows = self._run_witnesses(order, worktree)
+                commit = commit_claimed(
+                    repository=worktree,
+                    paths=paths,
+                    message=f"fleet: {order.task_id} ({order.id})",
+                    author_name=self.config.author_name,
+                    author_email=self.config.author_email,
+                )
+                pr_url: str | None = None
+                if order.publish_branch:
+                    publish_branch(worktree, order.branch)
+                    if order.create_draft_pr:
+                        body = self._pr_body(assignment, commit, witness_rows)
+                        pr_url = create_draft_pull_request(
+                            repository=worktree,
+                            branch=order.branch,
+                            base=self.config.base_branch,
+                            title=f"fleet: {order.task_id}",
+                            body_path=body,
+                        )
+                ready = {
+                    **fact,
+                    "commit": commit,
+                    "paths": paths,
+                    "witnesses": witness_rows,
+                    "pull_request_url": pr_url,
+                    "worktree_preserved": True,
+                }
+                self.journal.append("attempt.ready", ready)
+                return ready
+        except Exception as exc:
+            refused = {
+                **fact,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "worktree_preserved": worktree.exists(),
+            }
+            self.journal.append("attempt.refused", refused)
+            return refused
+        finally:
+            if semantic_acquired:
+                self.semantic_claims.release(owner=owner, task_id=order.task_id)
+
+    def run_once(self) -> CycleResult:
+        with ControllerLease(self.lease_path):
+            observation, orders = self.observe()
+            routes = self._routes()
+            plan = self.plan(observation, orders, routes)
+            attempts: list[Mapping[str, Any]] = []
+            if self.config.mode == "apply":
+                for assignment in plan.assignments:
+                    attempts.append(self.dispatch(assignment))
+            result = CycleResult(
+                mode=self.config.mode,
+                observation=observation,
+                plan=plan,
+                attempts=tuple(attempts),
+            )
+            self.journal.append(
+                "fleet.cycle.completed",
+                {
+                    "mode": result.mode,
+                    "base_sha": result.observation.head,
+                    "assignment_count": len(result.plan.assignments),
+                    "attempt_count": len(result.attempts),
+                },
+            )
+            return result
+
+    def serve(self) -> None:
+        while True:
+            started = time.monotonic()
+            try:
+                self.run_once()
+            except Exception as exc:
+                self.journal.append(
+                    "fleet.cycle.failed",
+                    {"error_type": type(exc).__name__, "error": str(exc)},
+                )
+            elapsed = time.monotonic() - started
+            time.sleep(max(1.0, self.config.interval_seconds - elapsed))
+
+    def status(self) -> Mapping[str, Any]:
+        rows = self.journal.verify()
+        latest = rows[-1] if rows else None
+        return {
+            "mode": self.config.mode,
+            "repository": str(self.config.repository),
+            "state_dir": str(self.config.state_dir),
+            "journal_events": len(rows),
+            "latest": latest,
+            "config_hash": config_hash(self.raw_config),
+        }
