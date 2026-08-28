@@ -1,0 +1,91 @@
+name: OpenClaw read-only gateway probe
+
+on:
+  push:
+    branches:
+      - probe/openclaw-readonly-20260828
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: openclaw-readonly-probe-20260828
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MAILBOX_ISSUE: "2"
+      OPENCLAW_GATEWAY_URL: "wss://claw.idol.id"
+      OPENCLAW_GATEWAY_ORIGIN: "https://claw.idol.id"
+    steps:
+      - name: Check out the transient probe
+        uses: actions/checkout@v4
+
+      - name: Install the WebSocket transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-save --ignore-scripts ws@8.18.3 >/dev/null
+
+      - name: Generate an ephemeral envelope key and run the read-only probe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cleanup() {
+            rm -f probe-private.pem probe-public.pem envelope.bin envelope.json
+          }
+          trap cleanup EXIT INT TERM
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out probe-private.pem 2>/dev/null
+          openssl pkey -in probe-private.pem -pubout -out probe-public.pem 2>/dev/null
+          public_key_b64="$(base64 -w0 probe-public.pem)"
+          echo "IDOL_PROBE_PUBLIC_KEY_V1=${public_key_b64}"
+          echo "IDOL_PROBE_WAITING_FOR_ENVELOPE_V1"
+
+          ciphertext=""
+          for _ in $(seq 1 180); do
+            ciphertext="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${MAILBOX_ISSUE}/comments" \
+              --jq '.[] | .body' 2>/dev/null \
+              | sed -n 's/^IDOL_PROBE_ENVELOPE_V1=//p' \
+              | tail -n 1)"
+            if [ -n "$ciphertext" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$ciphertext" ]; then
+            echo "IDOL_PROBE_ERROR=envelope-not-received"
+            exit 1
+          fi
+
+          printf '%s' "$ciphertext" | base64 -d > envelope.bin
+          openssl pkeyutl -decrypt \
+            -inkey probe-private.pem \
+            -in envelope.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256 \
+            -out envelope.json
+
+          shared_token="$(jq -r '.token // empty' envelope.json)"
+          bootstrap_token="$(jq -r '.bootstrapToken // empty' envelope.json)"
+          if [ -z "$shared_token" ] && [ -z "$bootstrap_token" ]; then
+            echo "IDOL_PROBE_ERROR=decrypted-envelope-has-no-auth-material"
+            exit 1
+          fi
+          if [ -n "$shared_token" ]; then echo "::add-mask::$shared_token"; fi
+          if [ -n "$bootstrap_token" ]; then echo "::add-mask::$bootstrap_token"; fi
+          export OPENCLAW_SHARED_TOKEN="$shared_token"
+          export OPENCLAW_BOOTSTRAP_TOKEN="$bootstrap_token"
+          unset ciphertext public_key_b64 shared_token bootstrap_token
+
+          echo "IDOL_PROBE_STARTING_V1"
+          node scripts/openclaw-readonly-probe.mjs
+          echo "IDOL_PROBE_FINISHED_V1"
