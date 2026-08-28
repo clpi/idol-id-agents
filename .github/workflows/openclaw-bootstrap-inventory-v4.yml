@@ -1,0 +1,167 @@
+name: OpenClaw signed bootstrap inventory v4
+
+on:
+  push:
+    branches:
+      - openclaw/browser-probe-20260828
+    paths:
+      - .github/workflows/openclaw-bootstrap-inventory-v4.yml
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Publish ephemeral transport key
+        id: key
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          umask 077
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /tmp/transport-private.pem >/dev/null 2>&1
+          openssl pkey -in /tmp/transport-private.pem -pubout -out /tmp/transport-public.pem >/dev/null 2>&1
+          public_b64="$(base64 -w0 /tmp/transport-public.pem)"
+          body="$(printf 'IDOL_OPENCLAW_KEY:%s\n%s' "$run_key" "$public_b64")"
+          jq -n --arg body "$body" '{body:$body}' >/tmp/key-comment.json
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/1/comments" \
+            --data-binary @/tmp/key-comment.json >/dev/null
+          echo "run_key=$run_key" >>"$GITHUB_OUTPUT"
+
+      - name: Receive encrypted bootstrap token and pinned runner
+        id: receive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_KEY: ${{ steps.key.outputs.run_key }}
+          EXPECTED_SCRIPT_SHA256: 750b948aec6bf8216a6d2fa0b05973cc35676a5877e285250288b521f049a1c8
+        shell: bash
+        run: |
+          set -euo pipefail
+          cipher=""
+          script_b64=""
+          for _ in $(seq 1 240); do
+            curl -fsS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/1/comments?per_page=100" \
+              >/tmp/comments.json
+            cipher="$(python3 - "$RUN_KEY" /tmp/comments.json <<'PY'
+          import json, sys
+          key, path = sys.argv[1], sys.argv[2]
+          marker = f"IDOL_OPENCLAW_CIPHERTEXT:{key}"
+          for comment in reversed(json.load(open(path))):
+              body = comment.get("body") or ""
+              if body.startswith(marker):
+                  rest = body[len(marker):]
+                  if rest.startswith("\\n"): rest = rest[2:]
+                  elif rest.startswith("\n"): rest = rest[1:]
+                  print(rest.strip())
+                  break
+          PY
+            )"
+            script_b64="$(python3 - "$RUN_KEY" /tmp/comments.json <<'PY'
+          import json, sys
+          key, path = sys.argv[1], sys.argv[2]
+          marker = f"IDOL_OPENCLAW_SCRIPT:{key}"
+          for comment in reversed(json.load(open(path))):
+              body = comment.get("body") or ""
+              if body.startswith(marker):
+                  rest = body[len(marker):]
+                  if rest.startswith("\\n"): rest = rest[2:]
+                  elif rest.startswith("\n"): rest = rest[1:]
+                  print(rest.strip())
+                  break
+          PY
+            )"
+            if [ -n "$cipher" ] && [ -n "$script_b64" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$cipher" ] || [ -z "$script_b64" ]; then
+            printf '%s\n' '{"schema":"idol.openclaw.bootstrap-inventory.v1","outcome":"handoff-timeout"}' >probe-result.json
+            echo "received=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s' "$cipher" | base64 -d >/tmp/bootstrap-cipher.bin
+          openssl pkeyutl -decrypt \
+            -inkey /tmp/transport-private.pem \
+            -in /tmp/bootstrap-cipher.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -out /tmp/idol-openclaw-bootstrap-token
+          bootstrap_token="$(cat /tmp/idol-openclaw-bootstrap-token)"
+          echo "::add-mask::$bootstrap_token"
+          unset bootstrap_token cipher
+
+          printf '%s' "$script_b64" | base64 -d >/tmp/openclaw-bootstrap-inventory.mjs
+          actual_sha="$(sha256sum /tmp/openclaw-bootstrap-inventory.mjs | awk '{print $1}')"
+          if [ "$actual_sha" != "$EXPECTED_SCRIPT_SHA256" ]; then
+            printf '%s\n' '{"schema":"idol.openclaw.bootstrap-inventory.v1","outcome":"runner-digest-mismatch"}' >probe-result.json
+            echo "received=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "received=true" >>"$GITHUB_OUTPUT"
+
+      - name: Install WebSocket transport
+        if: steps.receive.outputs.received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/idol-openclaw-node
+          cd /tmp/idol-openclaw-node
+          npm init -y >/dev/null 2>&1
+          npm install --silent ws@8
+          cp /tmp/openclaw-bootstrap-inventory.mjs ./probe.mjs
+
+      - name: Install local management-envelope public key
+        if: steps.receive.outputs.received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/management-public.b64 <<'EOF'
+          LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQ0lqQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FnOEFNSUlDQ2dLQ0FnRUF2V1FNd0RNSjUwQkE5eGVITjBwMgpkS0ZMdzdEMy9NNVJwTitPSXk4Q1hhYmIyWFJPNXY4Rm0yNXhiTzBrRDBvRW5Nb1NXUG05UUgxTWZEWjZXbGs1CmFOb1JuYS91Y1BmOHpSRlZIb21ubzJVRmN0VkVLTDdKUndHTTRnaGc4K1htRTZsNGFMaGNIaEJpN0pyR0FRWVUKMG5GRDdPMGF2WmNGMXVOMmRzZUlEbi9FNTBkbDhZU1poUUdhaG5uWVlGaXppcnlZRzNtZ3c0VGtSZll4UkhyTgoydVJQaUVQakVlWEFKU3VXSzdRT0pIK1BNZFgxTm44SUFLamRML3VCSXovWVowbnRqMXhqN0Z3dGhNUE9ybmRPCklFcnRSNjVJdGtleU9jQkNaRnE5SnZFVmV5ZTEyTE1EZmNUdHV4Ly9XVnZOTkxScmU2d0NMdDlyMkZQQWZ0azIKa0ExSDE2cUVuNlpaWUROVkxVcnBCbUY5Q25hR2RGejJjUVVoTGpYNVNwekhxVE9zZHVpVXhOMXI4Rmdramx2Tgprczhray9rRHJrbk9uVDNMTndhWlNaMDhZRHZ3cmlKV3puL0wrT2RIY0JyVjgrdGMzM1V2a21tZEx2NzA2RkxrClFnOWpVbUhjbzZpV0VoNitubTJPTWxYbDIwLzZYYlZOdUhGM0U3SnQwbDgrR3R6VzcrcmNJK2xTRHRaendhOFQKWWc0eU1BbmVaWnZrRTdrbGtkb0JlbWNSZW9VS2ZYVnlnRjI3aFRmdERiVjhhODVTQTN5Qkp0dEJUdjVsbjNJaAo0bGFlcWorSVVrOEt5SEE1N09HMzZiUVVUOTZjY3FtbUxrRzJDZ01xcjJTejRCTEhVZlpDN0RpWVhQU2hrZ3FnCjBESkJHUFhXY1pTSmRuTnY2Tk5jVHUwQ0F3RUFBUT09Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=
+          EOF
+          tr -d '[:space:]' </tmp/management-public.b64 | base64 -d >/tmp/idol-management-public.pem
+
+      - name: Bootstrap operator and collect sanitized inventory
+        if: steps.receive.outputs.received == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp/idol-openclaw-node
+          OPENCLAW_BOOTSTRAP_TOKEN_FILE=/tmp/idol-openclaw-bootstrap-token \
+          OPENCLAW_MANAGEMENT_PUBLIC_KEY_FILE=/tmp/idol-management-public.pem \
+          OPENCLAW_RESULT_FILE="$GITHUB_WORKSPACE/probe-result.json" \
+          OPENCLAW_ENVELOPE_FILE="$GITHUB_WORKSPACE/management-envelope.json" \
+            node probe.mjs
+
+      - name: Upload sanitized inventory and encrypted management identity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-bootstrap-inventory-${{ steps.key.outputs.run_key }}
+          path: |
+            probe-result.json
+            management-envelope.json
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Destroy transient plaintext and keys
+        if: always()
+        shell: bash
+        run: |
+          rm -f /tmp/transport-private.pem /tmp/transport-public.pem /tmp/key-comment.json \
+            /tmp/bootstrap-cipher.bin /tmp/idol-openclaw-bootstrap-token /tmp/comments.json \
+            /tmp/openclaw-bootstrap-inventory.mjs /tmp/idol-management-public.pem \
+            /tmp/management-public.b64
