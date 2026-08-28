@@ -1,0 +1,63 @@
+name: Verify allowance coordinator
+
+on:
+  push:
+    branches: [main, ops/allowance-coordinator-20260828]
+    paths:
+      - scripts/allowance_plan.py
+      - tests/test_allowance_plan.py
+      - config/allowance-policy.example.json
+      - docs/ALLOWANCE_COORDINATOR.md
+      - .github/workflows/allowance-planner-test.yml
+  pull_request:
+    paths:
+      - scripts/allowance_plan.py
+      - tests/test_allowance_plan.py
+      - config/allowance-policy.example.json
+      - docs/ALLOWANCE_COORDINATOR.md
+      - .github/workflows/allowance-planner-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compile and run fail-closed controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'NO_MODEL_INFERENCE=1'
+          echo 'NO_PROVIDER_CALLS=1'
+          python3 -m py_compile scripts/allowance_plan.py tests/test_allowance_plan.py
+          python3 -m unittest discover -s tests -v
+          python3 scripts/allowance_plan.py config/allowance-policy.example.json --pretty > /tmp/plan.json
+          python3 -m json.tool /tmp/plan.json >/dev/null
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          p = json.loads(Path('/tmp/plan.json').read_text(encoding='utf-8'))
+          assert p['automatic_dispatch'] is False
+          assert p['execution_ready'] is False
+          assert p['paygo_approved'] is False
+          assert all(a['provider_id'] != 'generic-paygo' for a in p['assignments'])
+          assert all(a['execution_ready'] is False for a in p['assignments'])
+          ids = {a['task_id'] for a in p['assignments']}
+          assert ids == {'P0-A-architecture', 'P0-B-observer'}, ids
+          providers = {a['task_id']: a['provider_id'] for a in p['assignments']}
+          assert providers['P0-A-architecture'] == 'codex-subscription'
+          assert providers['P0-B-observer'] == 'local-observer'
+          assert all('live-claim-unverified' in a['execution_blockers'] for a in p['assignments'])
+          assert all(any(b.startswith('telemetry-not-live:') for b in a['execution_blockers']) for a in p['assignments'])
+          print(json.dumps({
+              'planner': 'PASS',
+              'assignments': sorted(ids),
+              'execution_ready': False,
+              'paygo_selected': False,
+          }))
+          PY
