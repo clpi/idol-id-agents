@@ -1,0 +1,38 @@
+name: Fleet controller verification
+
+on:
+  push:
+    branches: [ops/live-fleet-control-20260828]
+    paths:
+      - fleet_control/**
+      - scripts/fleetctl.py
+      - scripts/collect_local.py
+      - tests/**
+      - config/fleet-policy.json
+      - .github/workflows/fleet-controller-test.yml
+  pull_request:
+    paths:
+      - fleet_control/**
+      - scripts/fleetctl.py
+      - scripts/collect_local.py
+      - tests/**
+      - config/fleet-policy.json
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      NO_MODEL_INFERENCE: "1"
+      NO_PAYG_USAGE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and test deterministic controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH=. python3 -m unittest discover -s tests -v
+          PYTHONPATH=. python3 -m py_compile fleet_control/*.py scripts/*.py
