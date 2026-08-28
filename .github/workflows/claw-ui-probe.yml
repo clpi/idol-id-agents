@@ -6,13 +6,17 @@ on:
     paths:
       - scripts/probe_claw_ui.py
       - scripts/probe_claw_browser.py
+      - scripts/audit_openclaw_package.py
       - tests/test_probe_claw_ui.py
+      - tests/test_audit_openclaw_package.py
       - .github/workflows/claw-ui-probe.yml
   pull_request:
     paths:
       - scripts/probe_claw_ui.py
       - scripts/probe_claw_browser.py
+      - scripts/audit_openclaw_package.py
       - tests/test_probe_claw_ui.py
+      - tests/test_audit_openclaw_package.py
       - .github/workflows/claw-ui-probe.yml
   workflow_dispatch:
   schedule:
@@ -24,15 +28,19 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
 
-      - name: Verify the HTTP evidence probe
+      - name: Verify HTTP and package evidence logic
         run: |
           set -euo pipefail
-          python3 -m py_compile scripts/probe_claw_ui.py tests/test_probe_claw_ui.py
-          python3 -m unittest tests.test_probe_claw_ui -v
+          python3 -m py_compile \
+            scripts/probe_claw_ui.py \
+            scripts/audit_openclaw_package.py \
+            tests/test_probe_claw_ui.py \
+            tests/test_audit_openclaw_package.py
+          python3 -m unittest discover -s tests -v
 
       - name: Install pinned browser evidence runtime
         run: |
@@ -51,6 +59,17 @@ jobs:
             https://claw.idol.id/ \
             --timeout 20 \
             --output artifacts/claw-http.json
+
+      - name: Compare live assets with signed OpenClaw package
+        id: package
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/audit_openclaw_package.py \
+            --package openclaw \
+            --version 2026.8.1-beta.3 \
+            --live-url https://claw.idol.id/ \
+            --output artifacts/openclaw-package.json
 
       - name: Execute the public shell in Chromium
         id: browser
@@ -73,11 +92,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Admit only a bootable surface
+      - name: Admit only a coherent, bootable surface
         if: always()
         env:
           HTTP_OUTCOME: ${{ steps.http.outcome }}
+          PACKAGE_OUTCOME: ${{ steps.package.outcome }}
           BROWSER_OUTCOME: ${{ steps.browser.outcome }}
         run: |
           test "$HTTP_OUTCOME" = success
+          test "$PACKAGE_OUTCOME" = success
           test "$BROWSER_OUTCOME" = success
