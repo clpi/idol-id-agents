@@ -1,0 +1,60 @@
+name: Probe Claw control UI
+
+on:
+  push:
+    branches: [main, ops/claw-control-ui-probe-20260828]
+    paths:
+      - scripts/probe_claw_ui.py
+      - tests/test_probe_claw_ui.py
+      - .github/workflows/claw-ui-probe.yml
+  pull_request:
+    paths:
+      - scripts/probe_claw_ui.py
+      - tests/test_probe_claw_ui.py
+      - .github/workflows/claw-ui-probe.yml
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify the evidence probe
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/probe_claw_ui.py tests/test_probe_claw_ui.py
+          python3 -m unittest tests.test_probe_claw_ui -v
+
+      - name: Observe the public boot surface
+        id: live
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python3 scripts/probe_claw_ui.py \
+            https://claw.idol.id/ \
+            --timeout 20 \
+            --output artifacts/claw-ui.json
+
+      - name: Preserve exact HTTP and asset evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claw-ui-${{ github.run_id }}
+          path: artifacts/claw-ui.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Admit only a bootable surface
+        if: always()
+        env:
+          LIVE_OUTCOME: ${{ steps.live.outcome }}
+        run: |
+          test "$LIVE_OUTCOME" = success
