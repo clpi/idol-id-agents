@@ -1,0 +1,15 @@
+{
+  "schema": "idol.fleet.outcome.v1",
+  "attempt_id": "00000000000000000000",
+  "order_id": "t_example_0001",
+  "task_id": "issue-000-example",
+  "route_id": "codex-subscription",
+  "verdict": "admitted",
+  "accepted_commit": "0000000000000000000000000000000000000000",
+  "reviewer_families": ["anthropic"],
+  "semantic_increment": 1.0,
+  "accepted_tokens": 10000,
+  "defects": 0,
+  "observed_at": 0,
+  "evidence": "integrated-head gate and review receipt identity"
+}
