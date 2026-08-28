@@ -1,0 +1,100 @@
+name: Hermes exact-command OpenClaw pairing
+
+on:
+  push:
+    branches:
+      - probe/openclaw-hermes-approve-20260828
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: openclaw-hermes-approve-20260828
+  cancel-in-progress: true
+
+jobs:
+  approve-and-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      MAILBOX_ISSUE: "4"
+      OPENCLAW_GATEWAY_URL: "wss://claw.idol.id"
+      OPENCLAW_GATEWAY_ORIGIN: "https://claw.idol.id"
+      HERMES_URL: "https://hermes.idol.id"
+    steps:
+      - name: Check out the transient probe
+        uses: actions/checkout@v4
+
+      - name: Install browser and WebSocket clients
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --no-save --ignore-scripts ws@8.18.3 playwright-core@1.55.0 >/dev/null
+          chrome="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$chrome" ]; then
+            echo "IDOL_APPROVE_ERROR=system-chrome-not-found"
+            exit 1
+          fi
+          echo "CHROME_BIN=$chrome" >> "$GITHUB_ENV"
+
+      - name: Decrypt credentials in memory, allow the exact command once, and inventory OpenClaw
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cleanup() {
+            rm -f probe-private.pem probe-public.pem envelope.bin envelope.json
+          }
+          trap cleanup EXIT INT TERM
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out probe-private.pem 2>/dev/null
+          openssl pkey -in probe-private.pem -pubout -out probe-public.pem 2>/dev/null
+          public_key_b64="$(base64 -w0 probe-public.pem)"
+          gh issue comment "$MAILBOX_ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body "IDOL_APPROVE_PUBLIC_KEY_V1=${public_key_b64}" >/dev/null
+          echo "IDOL_APPROVE_PUBLIC_KEY_PUBLISHED_V1"
+          echo "IDOL_APPROVE_WAITING_FOR_ENVELOPE_V1"
+
+          ciphertext=""
+          for _ in $(seq 1 180); do
+            ciphertext="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${MAILBOX_ISSUE}/comments" \
+              --jq '.[] | .body' 2>/dev/null \
+              | sed -n 's/^IDOL_APPROVE_ENVELOPE_V1=//p' \
+              | tail -n 1)"
+            if [ -n "$ciphertext" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$ciphertext" ]; then
+            echo "IDOL_APPROVE_ERROR=envelope-not-received"
+            exit 1
+          fi
+
+          printf '%s' "$ciphertext" | base64 -d > envelope.bin
+          openssl pkeyutl -decrypt \
+            -inkey probe-private.pem \
+            -in envelope.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256 \
+            -out envelope.json
+
+          openclaw_token="$(jq -r '.openclawToken // empty' envelope.json)"
+          hermes_password="$(jq -r '.hermesPassword // empty' envelope.json)"
+          if [ -z "$openclaw_token" ] || [ -z "$hermes_password" ]; then
+            echo "IDOL_APPROVE_ERROR=decrypted-envelope-missing-required-field"
+            exit 1
+          fi
+          echo "::add-mask::$openclaw_token"
+          echo "::add-mask::$hermes_password"
+          export OPENCLAW_SHARED_TOKEN="$openclaw_token"
+          export HERMES_PASSWORD="$hermes_password"
+          unset ciphertext public_key_b64 openclaw_token hermes_password
+
+          echo "IDOL_APPROVE_STARTING_V1"
+          node scripts/openclaw-hermes-approve.mjs
+          echo "IDOL_APPROVE_FINISHED_V1"
