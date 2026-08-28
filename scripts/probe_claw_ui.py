@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Probe the public Claw control UI boot surface without gateway credentials.
+"""Probe the public Claw control UI HTTP surface without credentials.
 
 The probe records exact HTTP/asset evidence while refusing to print asset
-contents or runtime secrets. It does not authenticate, open the gateway
-WebSocket, invoke an agent, or mutate the deployment.
+contents or runtime secrets. Static fallback markup is an observation, not a
+boot verdict; a browser-execution probe owns visibility and runtime errors.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import datetime as dt
 import hashlib
 import json
 import pathlib
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -190,9 +189,9 @@ def probe(url: str, timeout: float = 15.0) -> dict[str, Any]:
     if root.status == 200 and root.content_type != "text/html":
         errors.append(f"root-content-type:{root.content_type or 'missing'}")
 
-    fallback = any(marker.lower() in root_text.lower() for marker in FALLBACK_MARKERS)
-    if fallback:
-        errors.append("fallback-shell-present")
+    fallback_marker = any(
+        marker.lower() in root_text.lower() for marker in FALLBACK_MARKERS
+    )
 
     parser = BootAssetParser(root.final_url)
     if root.status == 200:
@@ -262,7 +261,7 @@ def probe(url: str, timeout: float = 15.0) -> dict[str, Any]:
     if config_response.error:
         errors.append(f"runtime-config-fetch:{config_response.error}")
 
-    report = {
+    return {
         "schema": "idol.claw.surface.v1",
         "observed_at": dt.datetime.now(UTC).isoformat(),
         "requested_url": requested,
@@ -274,7 +273,7 @@ def probe(url: str, timeout: float = 15.0) -> dict[str, Any]:
             "sha256": digest(root.body) if root.body else None,
             "cache_control": root.headers.get("cache-control"),
             "etag": root.headers.get("etag"),
-            "fallback_shell": fallback,
+            "fallback_marker": fallback_marker,
             "error": root.error,
         },
         "assets": assets,
@@ -295,7 +294,6 @@ def probe(url: str, timeout: float = 15.0) -> dict[str, Any]:
             "runtime_config_redacted": True,
         },
     }
-    return report
 
 
 def main() -> int:
