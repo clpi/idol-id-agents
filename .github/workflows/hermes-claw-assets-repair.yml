@@ -1,0 +1,91 @@
+name: Guarded Claw asset repair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: hermes-claw-assets-repair
+  cancel-in-progress: false
+
+jobs:
+  replace-verified-control-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MAILBOX_ISSUE: "6"
+      HERMES_URL: "https://hermes.idol.id"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install pinned browser client
+        run: |
+          set -euo pipefail
+          npm install --no-save --ignore-scripts playwright-core@1.55.0 >/dev/null
+          chrome="$(command -v google-chrome-stable || command -v google-chrome || command -v chromium || command -v chromium-browser || true)"
+          test -n "$chrome"
+          echo "CHROME_BIN=$chrome" >> "$GITHUB_ENV"
+
+      - name: Verify fixed transport and repair syntax
+        run: |
+          set -euo pipefail
+          node --check scripts/hermes-claw-assets-repair.mjs
+          sh -n scripts/repair-claw-control-ui.sh
+
+      - name: Decrypt Hermes credential in memory and submit the bounded repair
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          cleanup() {
+            rm -f repair-private.pem repair-public.pem envelope.bin envelope.json
+          }
+          trap cleanup EXIT INT TERM
+
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out repair-private.pem 2>/dev/null
+          openssl pkey -in repair-private.pem -pubout -out repair-public.pem 2>/dev/null
+          public_key_b64="$(base64 -w0 repair-public.pem)"
+          comment="$(gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${MAILBOX_ISSUE}/comments" \
+            -f "body=IDOL_TERMINAL_PUBLIC_KEY_V2=${public_key_b64}")"
+          public_id="$(printf '%s' "$comment" | jq -r '.id')"
+          echo "IDOL_CLAW_REPAIR_PUBLIC_KEY_PUBLISHED"
+
+          ciphertext=""
+          for _ in $(seq 1 120); do
+            ciphertext="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${MAILBOX_ISSUE}/comments" \
+              --jq ".[] | select(.id > ${public_id}) | .body" 2>/dev/null \
+              | sed -n 's/^IDOL_TERMINAL_ENVELOPE_V2=//p' \
+              | tail -n 1)"
+            if [ -n "$ciphertext" ]; then
+              break
+            fi
+            sleep 3
+          done
+          test -n "$ciphertext"
+
+          printf '%s' "$ciphertext" | base64 -d > envelope.bin
+          openssl pkeyutl -decrypt \
+            -inkey repair-private.pem \
+            -in envelope.bin \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256 \
+            -pkeyopt rsa_mgf1_md:sha256 \
+            -out envelope.json
+
+          hermes_password="$(jq -r '.hermesPassword // empty' envelope.json)"
+          test -n "$hermes_password"
+          echo "::add-mask::$hermes_password"
+          export HERMES_PASSWORD="$hermes_password"
+          unset ciphertext public_key_b64 hermes_password comment
+
+          node scripts/hermes-claw-assets-repair.mjs
+
+      - name: State the evidence boundary
+        if: always()
+        run: |
+          echo 'Terminal submission is not deployment success evidence.'
+          echo 'The independent package, HTTP, and Chromium probes remain authoritative.'
