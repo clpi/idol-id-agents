@@ -80,7 +80,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(report["summary"]["failed_assets"], 0)
         self.assertEqual(report["summary"]["script_assets"], 1)
 
-    def test_fallback_shell_fails_even_when_assets_are_reachable(self) -> None:
+    def test_fallback_marker_is_http_observation_not_boot_verdict(self) -> None:
         routes = {
             "/": (200, "text/html", page(fallback=True)),
             "/assets/app.css": (200, "text/css", b"body{}"),
@@ -89,8 +89,9 @@ class ProbeTests(unittest.TestCase):
         }
         with fixture(routes) as url:
             report = probe.probe(url, timeout=2)
-        self.assertFalse(report["ok"])
-        self.assertIn("fallback-shell-present", report["errors"])
+        self.assertTrue(report["ok"], json.dumps(report, indent=2))
+        self.assertTrue(report["root"]["fallback_marker"])
+        self.assertNotIn("fallback-shell-visible", report["errors"])
 
     def test_missing_script_fails_with_exact_asset_evidence(self) -> None:
         routes = {
