@@ -28,7 +28,9 @@ DEFAULT_VERSION = "2026.8.1-beta.3"
 DEFAULT_TARGETS = (
     "mcp-servers-CtWfZH8M.js",
     "mcp-app-security-BhWBPx_4.js",
+    "chat-page-DGyROxwr.js",
 )
+CONTROL_UI_SEGMENT = "/dist/control-ui/"
 MAX_TARBALL_BYTES = 256 * 1024 * 1024
 MAX_ASSET_BYTES = 32 * 1024 * 1024
 
@@ -128,7 +130,7 @@ def analyze_tarball(body: bytes, targets: tuple[str, ...]) -> dict[str, Any]:
     with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as archive:
         for member in archive.getmembers():
             name = safe_member_name(member.name)
-            if not member.isfile():
+            if not member.isfile() or CONTROL_UI_SEGMENT not in f"/{name}":
                 continue
             basename = pathlib.PurePosixPath(name).name
             lower = basename.lower()
@@ -139,7 +141,7 @@ def analyze_tarball(body: bytes, targets: tuple[str, ...]) -> dict[str, Any]:
                 continue
             content = stream.read(MAX_ASSET_BYTES + 1)
             if len(content) > MAX_ASSET_BYTES:
-                raise ValueError(f"asset exceeds byte limit: {name}")
+                raise ValueError(f"control UI asset exceeds byte limit: {name}")
             record = {
                 "path": name,
                 "basename": basename,
@@ -187,9 +189,13 @@ def fetch_live_assets(url: str) -> dict[str, Any]:
     parser = AssetParser(final_url)
     parser.feed(root.decode("utf-8", "replace"))
     parser.close()
+    root_parts = urllib.parse.urlsplit(final_url)
     seen: set[str] = set()
     assets: list[dict[str, Any]] = []
     for ref in parser.assets:
+        parts = urllib.parse.urlsplit(ref.url)
+        if parts.netloc != root_parts.netloc or not parts.path.startswith("/assets/"):
+            continue
         if ref.url in seen:
             continue
         seen.add(ref.url)
