@@ -1,0 +1,12 @@
+[project]
+name = "idol-fleet-control"
+version = "0.1.0"
+description = "No-pay-go, authority-bound continuous agent fleet controller for Idol and Idol Live"
+requires-python = ">=3.11"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+
+[tool.ruff]
+line-length = 100

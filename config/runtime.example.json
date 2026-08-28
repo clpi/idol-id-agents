@@ -1,0 +1,14 @@
+{
+  "action_commands": {
+    "agent.checkpoint": ["/usr/local/libexec/idol-fleet-action", "checkpoint", "{action_json}"],
+    "agent.start": ["/usr/local/libexec/idol-fleet-action", "start", "{action_json}"],
+    "agent.stop": ["/usr/local/libexec/idol-fleet-action", "stop", "{action_json}"],
+    "agent.suspend": ["/usr/local/libexec/idol-fleet-action", "suspend", "{action_json}"],
+    "claim.acquire": ["/usr/local/libexec/idol-fleet-action", "claim-acquire", "{action_json}"],
+    "claim.release": ["/usr/local/libexec/idol-fleet-action", "claim-release", "{action_json}"]
+  },
+  "actor": "idol-fleet-controller",
+  "apply_enabled": false,
+  "snapshot_command": ["python3", "/usr/local/libexec/idol-fleet/collect_local.py"],
+  "state_dir": "~/.local/state/idol-fleet"
+}

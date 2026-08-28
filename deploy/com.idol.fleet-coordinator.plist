@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.idol.fleet-coordinator</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>python3</string>
+    <string>/usr/local/libexec/idol-fleet/fleetctl.py</string>
+    <string>tick</string>
+    <string>--runtime</string><string>/Users/clp/.config/idol/fleet-runtime.json</string>
+    <string>--policy</string><string>/Users/clp/.config/idol/fleet-policy.json</string>
+    <string>--apply</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IDOL_FLEET_APPLY</key><string>1</string>
+    <key>IDOL_FLEET_COST_BOUNDARY</key><string>INCLUDED_ONLY</string>
+  </dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Users/clp/.local/state/idol-fleet/fleet.log</string>
+  <key>StandardErrorPath</key><string>/Users/clp/.local/state/idol-fleet/fleet.err.log</string>
+</dict>
+</plist>

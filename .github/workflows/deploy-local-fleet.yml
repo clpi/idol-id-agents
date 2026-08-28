@@ -1,0 +1,98 @@
+name: Deploy local Idol fleet controller
+
+on:
+  push:
+    branches: [ops/live-fleet-control-20260828]
+    paths:
+      - fleet_control/**
+      - scripts/**
+      - config/**
+      - tests/**
+      - .github/workflows/deploy-local-fleet.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-local-idol-fleet
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, macOS, ARM64, mac-mini, idol-native]
+    timeout-minutes: 20
+    env:
+      NO_MODEL_INFERENCE: "1"
+      NO_PAYG_USAGE: "1"
+      IDOL_FLEET_COST_BOUNDARY: INCLUDED_ONLY
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ops/live-fleet-control-20260828
+          fetch-depth: 1
+      - name: Resolve the canonical local Idol repository
+        id: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          for candidate in "$HOME/x/idol" "/Volumes/d 1/x/idol" "$HOME/idol"; do
+            if [[ -d "$candidate/.git" && -f "$candidate/tools/node/dev/claim" ]]; then
+              printf 'path=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo 'canonical local Idol repository not found' >&2
+          exit 2
+      - name: Verify and install transactionally
+        id: install
+        shell: bash
+        run: |
+          set +e
+          PYTHONPATH="$GITHUB_WORKSPACE" python3 scripts/install_local_fleet.py \
+            --source "$GITHUB_WORKSPACE" \
+            --repo "${{ steps.repo.outputs.path }}" \
+            --enable
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Persist sanitized deployment evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$HOME/.local/state/idol-fleet/install-report.json"
+          test -s "$report"
+          python3 - "$report" > fleet-install-status.json <<'PY'
+          import json, pathlib, sys
+          value=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          # The report is intentionally secret-free; retain only operational facts.
+          allowed={
+            'schema','installed_at','tests_passed','credential_rotation','adapter_ready',
+            'dry_run_passed','apply_enabled','continuous_service_loaded','no_payg_usage',
+            'automatic_merge','reason','detail','probe'
+          }
+          print(json.dumps({k:v for k,v in value.items() if k in allowed}, indent=2, sort_keys=True))
+          PY
+          git config user.name idol-fleet-deployer
+          git config user.email noreply@idol.id
+          git add fleet-install-status.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'ops: record local fleet deployment status [skip ci]'
+            git push origin HEAD:ops/live-fleet-control-20260828
+          fi
+      - name: Enforce continuous-control readiness
+        shell: bash
+        run: |
+          test "${{ steps.install.outputs.rc }}" = 0
+          python3 - <<'PY'
+          import json
+          value=json.load(open('fleet-install-status.json'))
+          assert value.get('credential_rotation') is True
+          assert value.get('adapter_ready') is True
+          assert value.get('dry_run_passed') is True
+          assert value.get('apply_enabled') is True
+          assert value.get('continuous_service_loaded') is True
+          assert value.get('no_payg_usage') is True
+          assert value.get('automatic_merge') is False
+          PY

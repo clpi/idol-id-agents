@@ -1,0 +1,114 @@
+{
+  "openai-codex": {
+    "agent_aliases": ["codex", "openai-codex"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "openai",
+    "max_concurrency": 2,
+    "premium": true,
+    "quality": 0.97,
+    "require_usage_telemetry": true,
+    "roles": ["architect", "implementer", "reviewer", "integrator"]
+  },
+  "anthropic": {
+    "agent_aliases": ["claude", "anthropic"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "anthropic",
+    "max_concurrency": 2,
+    "premium": true,
+    "quality": 0.96,
+    "require_usage_telemetry": true,
+    "roles": ["architect", "implementer", "reviewer", "integrator"]
+  },
+  "ollama": {
+    "agent_aliases": ["ollama"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "ollama",
+    "max_concurrency": 3,
+    "premium": false,
+    "quality": 0.68,
+    "require_usage_telemetry": true,
+    "roles": ["observer", "counterexample", "evidence", "mechanic"]
+  },
+  "zai": {
+    "agent_aliases": ["zai", "glm"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "zai",
+    "max_concurrency": 3,
+    "premium": false,
+    "quality": 0.79,
+    "require_usage_telemetry": true,
+    "roles": ["counterexample", "implementer", "evidence", "observer"]
+  },
+  "alibaba": {
+    "agent_aliases": ["qwen", "alibaba"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "alibaba",
+    "max_concurrency": 3,
+    "premium": false,
+    "quality": 0.78,
+    "require_usage_telemetry": true,
+    "roles": ["counterexample", "implementer", "evidence", "mechanic"]
+  },
+  "mimo": {
+    "agent_aliases": ["mimo", "xiaomi"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "mimo",
+    "max_concurrency": 2,
+    "premium": false,
+    "quality": 0.7,
+    "require_usage_telemetry": true,
+    "roles": ["counterexample", "implementer", "evidence", "mechanic"]
+  },
+  "devin": {
+    "agent_aliases": ["devin"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "cognition",
+    "max_concurrency": 1,
+    "premium": false,
+    "quality": 0.78,
+    "require_usage_telemetry": true,
+    "roles": ["implementer", "mechanic"]
+  },
+  "google": {
+    "agent_aliases": ["gemini", "google"],
+    "cost_class": "included",
+    "enabled": true,
+    "family": "google",
+    "max_concurrency": 2,
+    "premium": false,
+    "quality": 0.83,
+    "require_usage_telemetry": true,
+    "roles": ["counterexample", "reviewer", "evidence", "observer"]
+  },
+  "openrouter": {
+    "cost_class": "purchased_credit",
+    "enabled": false,
+    "family": "openrouter",
+    "max_concurrency": 0,
+    "quality": 0,
+    "roles": []
+  },
+  "bedrock": {
+    "cost_class": "paygo",
+    "enabled": false,
+    "family": "aws",
+    "max_concurrency": 0,
+    "quality": 0,
+    "roles": []
+  },
+  "vertex": {
+    "cost_class": "paygo",
+    "enabled": false,
+    "family": "google-cloud",
+    "max_concurrency": 0,
+    "quality": 0,
+    "roles": []
+  }
+}

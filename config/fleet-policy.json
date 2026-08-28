@@ -1,0 +1,11 @@
+{
+  "allow_paygo": false,
+  "automatic_merge": false,
+  "checkpoint_buffer_minutes": 20,
+  "max_agents_total": 12,
+  "max_starts_per_tick": 4,
+  "minimum_remaining_fraction": 0.02,
+  "require_independent_review_family": true,
+  "reset_urgency_minutes": 180,
+  "stale_agent_seconds": 1800
+}
