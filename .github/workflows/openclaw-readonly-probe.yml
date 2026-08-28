@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  issues: read
+  issues: write
 
 concurrency:
   group: openclaw-readonly-probe-20260828
@@ -46,7 +46,9 @@ jobs:
           openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out probe-private.pem 2>/dev/null
           openssl pkey -in probe-private.pem -pubout -out probe-public.pem 2>/dev/null
           public_key_b64="$(base64 -w0 probe-public.pem)"
-          echo "IDOL_PROBE_PUBLIC_KEY_V1=${public_key_b64}"
+          gh issue comment "$MAILBOX_ISSUE" --repo "$GITHUB_REPOSITORY" \
+            --body "IDOL_PROBE_PUBLIC_KEY_V1=${public_key_b64}" >/dev/null
+          echo "IDOL_PROBE_PUBLIC_KEY_PUBLISHED_V1"
           echo "IDOL_PROBE_WAITING_FOR_ENVELOPE_V1"
 
           ciphertext=""
