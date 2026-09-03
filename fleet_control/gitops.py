@@ -211,7 +211,11 @@ def path_is_claimed(path: str, claims: Iterable[str]) -> bool:
 
 
 def require_claimed_changes(repository: Path, claims: Sequence[str]) -> tuple[str, ...]:
-    paths = changed_paths(repository)
+    return require_claimed_paths(changed_paths(repository), claims)
+
+
+def require_claimed_paths(paths: Sequence[str], claims: Sequence[str]) -> tuple[str, ...]:
+    paths = tuple(paths)
     if not paths:
         raise GitRefusal("attempt produced no changed files")
     outside = tuple(path for path in paths if not path_is_claimed(path, claims))

@@ -15,6 +15,7 @@ from .calibration import CalibrationError, apply_calibration, calibrate, config_
 from .claims import ControllerLease, RepositoryClaimTransaction, SemanticClaimStore
 from .gitops import (
     GitRefusal,
+    changed_paths,
     commit_claimed,
     create_draft_pull_request,
     create_worktree,
@@ -26,6 +27,7 @@ from .gitops import (
     publish_branch,
     remote_branch_sha,
     require_claimed_changes,
+    require_claimed_paths,
     require_exact_subject,
 )
 from .health import apply_circuits, record_failure, record_success
@@ -262,6 +264,7 @@ class FleetController:
             "attempt.refused",
             "attempt.failed",
             "attempt.cancelled",
+            "attempt.no-change",
             "attempt.admitted",
             "attempt.rejected",
             "attempt.reverted",
@@ -448,6 +451,7 @@ class FleetController:
                 "attempt.refused",
                 "attempt.failed",
                 "attempt.cancelled",
+                "attempt.no-change",
                 "attempt.admitted",
                 "attempt.rejected",
                 "attempt.reverted",
@@ -471,6 +475,7 @@ class FleetController:
             "attempt.refused",
             "attempt.failed",
             "attempt.cancelled",
+            "attempt.no-change",
             "attempt.rejected",
             "attempt.reverted",
         }
@@ -591,6 +596,11 @@ class FleetController:
             "- Do not merge, rewrite history, clean another worktree, spend pay-go credits, redeem resets, or change provider configuration.\n",
             f"- You may edit only: {', '.join(order.path_claims)}.\n",
             f"- Semantic claims: {', '.join(order.semantic_claims)}.\n",
+            (
+                "- A no-edit conclusion is admissible only when every required witness passes on this exact subject; explain why no repository delta is warranted.\n"
+                if order.allow_no_change
+                else "- This order requires a contained repository delta; a no-edit conclusion is not an admitted outcome.\n"
+            ),
             "\n## Stop conditions\n",
             *[f"- {condition}\n" for condition in order.stop_conditions],
             "\n## Required witnesses\n",
@@ -789,7 +799,13 @@ class FleetController:
                         "stderr_hash": hashlib.sha256(result.stderr.encode()).hexdigest(),
                     },
                 )
-                paths = require_claimed_changes(worktree, order.path_claims)
+                require_exact_subject(worktree, order.base_sha)
+                paths = changed_paths(worktree)
+                if paths:
+                    paths = require_claimed_paths(paths, order.path_claims)
+                elif not order.allow_no_change:
+                    raise GitRefusal("attempt produced no changed files")
+
                 def renew_claims() -> None:
                     self.semantic_claims.renew(
                         owner=owner,
@@ -808,6 +824,21 @@ class FleetController:
                     worktree,
                     renew_claims=renew_claims,
                 )
+                require_exact_subject(worktree, order.base_sha)
+                if not paths:
+                    witness_changes = changed_paths(worktree)
+                    if witness_changes:
+                        raise GitRefusal(
+                            "witness mutated a no-change worktree: " + ", ".join(witness_changes)
+                        )
+                    no_change = {
+                        **fact,
+                        "paths": (),
+                        "witnesses": witness_rows,
+                        "worktree_preserved": True,
+                    }
+                    self.journal.append("attempt.no-change", no_change)
+                    return no_change
                 paths = require_claimed_changes(worktree, order.path_claims)
                 commit = commit_claimed(
                     repository=worktree,

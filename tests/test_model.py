@@ -76,6 +76,14 @@ class ModelTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 WorkOrder(**values)
 
+    def test_no_change_is_limited_to_evidence_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            order = self.order(pathlib.Path(temporary))
+            with self.assertRaisesRegex(ValueError, "evidence-producing roles"):
+                replace(order, allow_no_change=True)
+            evidence = replace(order, role="evidence", allow_no_change=True)
+            self.assertTrue(evidence.allow_no_change)
+
     def test_route_rejects_unknown_parser(self) -> None:
         route = self.route()
         values = {field: getattr(route, field) for field in route.__dataclass_fields__}
