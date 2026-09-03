@@ -1,0 +1,35 @@
+{
+  "id": "t_example_0001",
+  "task_id": "issue-000-example",
+  "repository": "/Users/USER/x/idol",
+  "base_sha": "0000000000000000000000000000000000000000",
+  "branch": "fleet/issue-000-example/t-example-0001",
+  "role": "mechanic",
+  "required_outcome": "Apply one already-decided mechanical repair without changing semantic behavior, authority, vocabulary, or evidence ownership.",
+  "path_claims": ["path/to/claimed/file"],
+  "semantic_claims": ["evidence/example/mechanical-projection"],
+  "stop_conditions": [
+    "The checked-out SHA differs from the work order.",
+    "The requested change requires a semantic decision.",
+    "Any required edit falls outside the named path claim.",
+    "A witness cannot fail on a planted counterexample."
+  ],
+  "witnesses": [
+    ["sh", "gate/example.sh"],
+    ["git", "diff", "--check"]
+  ],
+  "route_ids": ["ollama-local-observer"],
+  "authority_files": [
+    "docs/spec/law.md",
+    "docs/spec/constitution.md",
+    "docs/bootstrap.md"
+  ],
+  "risk": "low",
+  "priority": 50,
+  "estimated_seconds": 600,
+  "estimated_tokens": 8000,
+  "reviewer_family": null,
+  "issue": "https://github.com/clpi/idol/issues/000",
+  "publish_branch": true,
+  "create_draft_pr": true
+}
