@@ -87,6 +87,7 @@ EOF
 chmod 600 "$UNIT"
 systemctl --user disable --now idol-fleet-observe.service >/dev/null 2>&1 || true
 systemctl --user daemon-reload
-systemctl --user enable --now "$SERVICE"
+systemctl --user enable "$SERVICE"
+systemctl --user restart "$SERVICE"
 systemctl --user --no-pager --full status "$SERVICE" | sed -n '1,100p'
 echo "installed $SERVICE in calibrated apply mode"
