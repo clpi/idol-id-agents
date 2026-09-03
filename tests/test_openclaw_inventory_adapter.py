@@ -73,6 +73,12 @@ class OpenClawInventoryAdapterTests(unittest.TestCase):
         self.assertEqual(payload["source"], "local-process-fast-fence")
         self.assertEqual(payload["sessions"], [process])
 
+    def test_kimi_code_process_is_fenced(self) -> None:
+        self.assertEqual(
+            adapter.process_actor(["/home/clp/.local/bin/kimi-code", "--session", "one"]),
+            "kimi-cli",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
