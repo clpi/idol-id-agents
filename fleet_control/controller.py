@@ -19,8 +19,12 @@ from .gitops import (
     create_draft_pull_request,
     create_worktree,
     current_sha,
+    fast_forward,
+    fetch_remote_branch,
     is_dirty,
+    paths_changed,
     publish_branch,
+    remote_branch_sha,
     require_claimed_changes,
     require_exact_subject,
 )
@@ -56,6 +60,9 @@ class ControllerConfig:
     calibration_ttl_seconds: int
     repository_claim_required: bool
     max_consecutive_cycle_failures: int
+    remote_name: str
+    remote_head_required: bool
+    auto_fast_forward: bool
     routes: tuple[Route, ...]
 
     def __post_init__(self) -> None:
@@ -83,6 +90,8 @@ class ControllerConfig:
             raise ValueError("controller requires at least one route")
         if self.max_consecutive_cycle_failures < 1 or self.max_consecutive_cycle_failures > 100:
             raise ValueError("max_consecutive_cycle_failures outside supported bounds")
+        if self.auto_fast_forward and not self.remote_head_required:
+            raise ValueError("auto_fast_forward requires remote_head_required")
         enabled_routes = tuple(route for route in self.routes if route.enabled)
         if self.mode == "apply" and not enabled_routes:
             raise ValueError("apply mode requires at least one enabled route")
@@ -98,6 +107,9 @@ class Observation:
     at: float
     repository: str
     head: str
+    remote_head: str | None
+    remote_in_sync: bool | None
+    remote_error: str | None
     dirty: bool
     work_orders: tuple[str, ...]
     invalid_work_orders: Mapping[str, str]
@@ -149,6 +161,9 @@ def load_config(path: Path) -> tuple[Mapping[str, Any], ControllerConfig]:
         calibration_ttl_seconds=int(raw.get("calibration_ttl_seconds", 21600)),
         repository_claim_required=raw.get("repository_claim_required", True) is True,
         max_consecutive_cycle_failures=int(raw.get("max_consecutive_cycle_failures", 5)),
+        remote_name=str(raw.get("remote_name", "origin")),
+        remote_head_required=raw.get("remote_head_required", False) is True,
+        auto_fast_forward=raw.get("auto_fast_forward", False) is True,
         routes=routes,
     )
     return raw, config
@@ -240,16 +255,181 @@ class FleetController:
             raise ControllerError("duplicate work-order ids: " + ", ".join(duplicates))
         return tuple(orders), invalid
 
+    def _running_attempt_ids(self) -> frozenset[str]:
+        state: dict[str, str] = {}
+        terminal = {
+            "attempt.ready",
+            "attempt.refused",
+            "attempt.failed",
+            "attempt.cancelled",
+            "attempt.admitted",
+            "attempt.rejected",
+            "attempt.reverted",
+        }
+        for row in self.journal.events():
+            fact = row.get("fact")
+            if not isinstance(fact, Mapping):
+                continue
+            attempt_id = fact.get("attempt_id")
+            if not isinstance(attempt_id, str):
+                continue
+            kind = str(row.get("kind"))
+            if kind == "attempt.started":
+                state[attempt_id] = kind
+            elif kind in terminal:
+                state[attempt_id] = kind
+        return frozenset(attempt_id for attempt_id, kind in state.items() if kind == "attempt.started")
+
+    @staticmethod
+    def _write_rebound_order(
+        path: Path,
+        *,
+        old_sha: str,
+        new_sha: str,
+        expected_hash: str,
+    ) -> None:
+        raw = mapping(json.loads(path.read_text(encoding="utf-8")), "work order")
+        if stable_hash(raw) != expected_hash:
+            raise ControllerError(f"work order changed before remote rebind: {path.name}")
+        if raw.get("base_sha") != old_sha:
+            raise ControllerError(f"work order moved during remote refresh: {path.name}")
+        updated = dict(raw)
+        updated["base_sha"] = new_sha
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(updated, handle, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def refresh_remote_base(self) -> None:
+        if not self.config.remote_head_required or self.config.mode != "apply" or not self.config.auto_fast_forward:
+            return
+        observed_at = time.time()
+        old_sha: str | None = None
+        new_sha: str | None = None
+        moved = False
+        try:
+            old_sha = current_sha(self.config.repository)
+            new_sha = fetch_remote_branch(
+                self.config.repository,
+                remote=self.config.remote_name,
+                branch=self.config.base_branch,
+            )
+            if new_sha == old_sha:
+                return
+            if is_dirty(self.config.repository):
+                raise GitRefusal("authority worktree is dirty")
+            running = self._running_attempt_ids()
+            if running:
+                raise GitRefusal("controller has a non-terminal attempt")
+            if self.semantic_claims.list() or self.path_claims.list():
+                raise GitRefusal("controller has live claims")
+            orders, invalid = self._load_work_orders()
+            if invalid:
+                raise GitRefusal("invalid work orders prevent automatic remote refresh")
+            rebound: list[tuple[Path, str, str]] = []
+            held: dict[str, str] = {}
+            by_id = {order.id: order for order in orders}
+            for path in sorted(self.config.work_orders_dir.glob("*.json")):
+                raw = mapping(json.loads(path.read_text(encoding="utf-8")), "work order")
+                order_id = str(raw.get("id", ""))
+                order = by_id.get(order_id)
+                if order is None:
+                    raise GitRefusal(f"work order changed during remote refresh: {path.name}")
+                if order.base_sha != old_sha:
+                    held[order.id] = "work-order-subject-already-differs"
+                    continue
+                if not order.follow_remote_main:
+                    held[order.id] = "follow-remote-main-disabled"
+                    continue
+                watched = tuple(dict.fromkeys((*order.path_claims, *order.authority_files)))
+                if paths_changed(self.config.repository, old_sha, new_sha, watched):
+                    held[order.id] = "watched-path-changed"
+                    continue
+                rebound.append((path, order.id, stable_hash(raw)))
+            fast_forward(
+                self.config.repository,
+                branch=self.config.base_branch,
+                new_sha=new_sha,
+            )
+            moved = True
+            rebound_orders: list[str] = []
+            rebind_refusals: dict[str, str] = {}
+            for path, order_id, expected_hash in rebound:
+                try:
+                    self._write_rebound_order(
+                        path,
+                        old_sha=old_sha,
+                        new_sha=new_sha,
+                        expected_hash=expected_hash,
+                    )
+                    rebound_orders.append(order_id)
+                except Exception as exc:
+                    rebind_refusals[order_id] = f"{type(exc).__name__}: {exc}"
+            self.journal.append(
+                "fleet.base.fast-forwarded",
+                {
+                    "remote": self.config.remote_name,
+                    "branch": self.config.base_branch,
+                    "old_sha": old_sha,
+                    "new_sha": new_sha,
+                    "rebound_orders": rebound_orders,
+                    "rebind_refusals": rebind_refusals,
+                    "held_orders": held,
+                },
+                at=observed_at,
+            )
+        except Exception as exc:
+            self.journal.append(
+                "fleet.base.post-refresh-refused" if moved else "fleet.base.refresh-refused",
+                {
+                    "remote": self.config.remote_name,
+                    "branch": self.config.base_branch,
+                    "old_sha": old_sha,
+                    "new_sha": new_sha,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                at=observed_at,
+            )
+
     def observe(self) -> tuple[Observation, tuple[WorkOrder, ...]]:
         if not (self.config.repository / ".git").exists():
             raise ControllerError(f"configured repository is not a Git worktree: {self.config.repository}")
         head = current_sha(self.config.repository)
+        remote_head: str | None = None
+        remote_error: str | None = None
+        if self.config.remote_head_required:
+            try:
+                remote_head = remote_branch_sha(
+                    self.config.repository,
+                    remote=self.config.remote_name,
+                    branch=self.config.base_branch,
+                )
+            except Exception as exc:
+                remote_error = f"{type(exc).__name__}: {exc}"
         orders, invalid = self._load_work_orders()
         claims = self.semantic_claims.list()
         observation = Observation(
             at=time.time(),
             repository=str(self.config.repository),
             head=head,
+            remote_head=remote_head,
+            remote_in_sync=(head == remote_head) if remote_head is not None else None,
+            remote_error=remote_error,
             dirty=is_dirty(self.config.repository),
             work_orders=tuple(order.id for order in orders),
             invalid_work_orders=invalid,
@@ -305,6 +485,39 @@ class FleetController:
         )
 
     def plan(self, observation: Observation, orders: Sequence[WorkOrder], routes: Sequence[Route]) -> Plan:
+        remote_reasons: tuple[str, ...] = ()
+        if self.config.remote_head_required:
+            if observation.remote_error is not None or observation.remote_head is None:
+                remote_reasons = ("remote-head-unavailable",)
+            elif observation.remote_head != observation.head:
+                remote_reasons = ("remote-head-mismatch",)
+        if remote_reasons:
+            plan = build_plan(
+                base_sha=observation.head,
+                orders=(),
+                routes=routes,
+                max_assignments=self.config.max_assignments,
+                now=observation.at,
+                route_performance=route_factors(self.journal),
+            )
+            plan = Plan(
+                observed_at=plan.observed_at,
+                base_sha=plan.base_sha,
+                assignments=(),
+                rejections=tuple(Rejection(order.id, None, remote_reasons) for order in orders),
+            )
+            self.journal.append(
+                "fleet.proposed",
+                {
+                    "mode": self.config.mode,
+                    "base_sha": plan.base_sha,
+                    "remote_head": observation.remote_head,
+                    "assignments": [],
+                    "rejections": [asdict(rejection) for rejection in plan.rejections],
+                },
+                at=observation.at,
+            )
+            return plan
         active_ids = self._active_order_ids()
         available = tuple(order for order in orders if order.id not in active_ids)
         duplicate_rejections = tuple(
@@ -476,6 +689,17 @@ class FleetController:
         require_exact_subject(self.config.repository, order.base_sha)
         if is_dirty(self.config.repository):
             raise ControllerError("apply refuses a dirty authority worktree")
+        if self.config.remote_head_required:
+            remote_sha = remote_branch_sha(
+                self.config.repository,
+                remote=self.config.remote_name,
+                branch=self.config.base_branch,
+            )
+            if remote_sha != order.base_sha:
+                raise GitRefusal(
+                    f"remote subject moved: work order is {order.base_sha}, "
+                    f"{self.config.remote_name}/{self.config.base_branch} is {remote_sha}"
+                )
         owner = f"fleet-{stable_hash({'route': route.id, 'order': order.id})[:16]}"
         work_item = f"work-{stable_hash(order.task_id)[:16]}"
         repository_subject = stable_hash(str(self.config.repository.resolve()))[:16]
@@ -644,6 +868,7 @@ class FleetController:
     def run_once(self) -> CycleResult:
         with ControllerLease(self.lease_path):
             self.reconcile_expired_attempts()
+            self.refresh_remote_base()
             observation, orders = self.observe()
             routes = self._routes(now=observation.at)
             plan = self.plan(observation, orders, routes)
