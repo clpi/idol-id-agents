@@ -15,6 +15,8 @@ case "$CONFIG" in /*) ;; *) echo "configuration path must be absolute" >&2; exit
 [ "$(uname -s)" = Linux ] || { echo "this installer is for Linux systemd --user" >&2; exit 2; }
 PYTHON=${PYTHON:-$(command -v python3)}
 [ -n "$PYTHON" ] || { echo "python3 not found" >&2; exit 2; }
+SERVICE_PATH=${FLEET_SERVICE_PATH:-$PATH}
+case "$SERVICE_PATH" in ''|*[!A-Za-z0-9_./:+-]*) echo "service PATH contains unsupported characters" >&2; exit 2 ;; esac
 "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' || {
   echo "Python 3.10 or newer is required" >&2
   exit 2
@@ -62,6 +64,7 @@ Type=simple
 WorkingDirectory=$ROOT
 Environment=PYTHONPATH=$ROOT
 Environment=IDOL_FLEET_NO_PAYGO=1
+Environment=PATH=$SERVICE_PATH
 ExecStart=$PYTHON -m fleet_control.cli --config $CONFIG serve --mode apply
 Restart=always
 RestartSec=15
