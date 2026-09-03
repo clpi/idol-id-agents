@@ -263,6 +263,7 @@ class ManagedFleetController(FleetController):
     def run_once(self) -> CycleResult:
         with ControllerLease(self.lease_path):
             self.reconcile_expired_attempts()
+            self.refresh_remote_base()
             observation, orders = self.observe()
             self.reconcile_sessions(head=observation.head, now=observation.at)
             routes = self._routes(now=observation.at)

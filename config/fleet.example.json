@@ -15,6 +15,9 @@
   "calibration_ttl_seconds": 21600,
   "repository_claim_required": true,
   "max_consecutive_cycle_failures": 5,
+  "remote_name": "origin",
+  "remote_head_required": true,
+  "auto_fast_forward": false,
   "routes": [
     {
       "id": "ollama-local-observer",

@@ -205,6 +205,7 @@ class WorkOrder:
     issue: str | None = None
     publish_branch: bool = True
     create_draft_pr: bool = True
+    follow_remote_main: bool = False
 
     def __post_init__(self) -> None:
         for label, value in (("work-order id", self.id), ("task id", self.task_id), ("role", self.role)):
@@ -269,6 +270,7 @@ class WorkOrder:
             issue=str(issue).strip() if issue else None,
             publish_branch=raw.get("publish_branch", True) is True,
             create_draft_pr=raw.get("create_draft_pr", True) is True,
+            follow_remote_main=raw.get("follow_remote_main", False) is True,
         )
 
 

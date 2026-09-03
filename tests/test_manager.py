@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from fleet_control.calibration import calibrate
 from fleet_control.controller import load_config
@@ -233,6 +234,14 @@ class ManagerTests(unittest.TestCase):
             self.assertFalse(result.plan.assignments)
             reasons = [reason for row in result.plan.rejections for reason in row.reasons]
             self.assertIn("unidentified-live-session", reasons)
+
+    def test_managed_cycle_runs_remote_refresh_before_observation(self) -> None:
+        temporary, config_path, head, cancel_log = self.fixture()
+        with temporary:
+            controller = ManagedFleetController(config_path=config_path)
+            with mock.patch.object(controller, "refresh_remote_base") as refresh:
+                controller.run_once()
+            refresh.assert_called_once_with()
 
 
 if __name__ == "__main__":

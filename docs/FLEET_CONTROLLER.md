@@ -21,6 +21,8 @@ LIVE owns actors, tasks, attempts, claims, routes, allowance observations, witne
 - **Observe-plan is the installation default.** It may inspect local state and write private controller state. It cannot invoke a model, acquire claims, create worktrees, edit repositories, push branches, or create pull requests.
 - **Apply is hash-bound.** Apply requires a current calibration record covering the controller version, configuration hash, route identity, billing proof, stale-SHA refusal, claim overlap, outside-path refusal, bounded process termination, and no-pay-go controls.
 - **One attempt, exact subject.** A work order names one task, exact base SHA, exact path claims, semantic claims, required outcome, stop conditions, witnesses, role, route set, and expected review family.
+- **The configured remote branch is part of admission.** When `remote_head_required` is enabled, observation and dispatch both require the authority clone's exact SHA to equal that branch. A missing or moved remote head fails closed.
+- **Fast-forward does not silently redefine work.** In apply mode, `auto_fast_forward` may advance only a clean authority branch along a proven fast-forward with no live controller attempt or claims. A work order is rebound only when it explicitly opts into `follow_remote_main` and neither its claimed paths nor its authority manifest changed. Every other order remains stale and held for re-adjudication.
 - **Two claim layers.** Every repository path enters the controller’s private hierarchical path store; IDOL additionally uses its repository-owned positional `tools/node/dev/claim` authority. Semantic boundaries use a separate private hierarchical store. Any conflict blocks dispatch. A repository without an executable claim adapter, such as today’s early LIVE source tree, must opt into the private path store explicitly with `repository_claim_required: false`.
 - **No shell-shaped work orders.** Runtime commands and witness commands are argument vectors. The controller never evaluates work-order text through a shell.
 - **Containment is measured after execution.** Any edit outside the claimed paths holds the attempt and preserves the worktree. A successful process is not successful work.
@@ -33,7 +35,7 @@ LIVE owns actors, tasks, attempts, claims, routes, allowance observations, witne
 Each cycle:
 
 1. acquire the single-controller lease;
-2. observe repository SHA, dirty state, claims, queued work orders, route proofs, and allowance snapshots without model inference;
+2. fetch and fast-forward a configured remote authority only under the bounded rebind law above, then observe local and remote SHA, dirty state, claims, queued work orders, route proofs, and allowance snapshots without model inference;
 3. reject stale or incomplete work orders;
 4. rank eligible `(work order, route)` pairs by priority, role fit, reset urgency, estimated completion likelihood, reviewer separation, and premium-capacity conservation;
 5. write the observation and proposal to the append-only private journal;

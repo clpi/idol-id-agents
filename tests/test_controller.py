@@ -6,10 +6,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from fleet_control.calibration import calibrate
-from fleet_control.controller import FleetController, load_config
-from fleet_control.gitops import current_sha
+from fleet_control.controller import ControllerError, FleetController, load_config
+from fleet_control.gitops import GitRefusal, current_sha
+from fleet_control.model import stable_hash
 
 
 class ControllerTests(unittest.TestCase):
@@ -146,6 +148,42 @@ class ControllerTests(unittest.TestCase):
         claim_log.write_text("")
         return temporary, root, repo, state, config_path, agent, claim_log
 
+    def add_remote(self, root: Path, repo: Path) -> Path:
+        origin = root / "origin.git"
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(origin)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        self.git(repo, "remote", "add", "origin", str(origin))
+        self.git(repo, "push", "-u", "origin", "main")
+        writer = root / "writer"
+        subprocess.run(
+            ["git", "clone", str(origin), str(writer)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        self.git(writer, "config", "user.name", "remote-test")
+        self.git(writer, "config", "user.email", "remote@example.com")
+        return writer
+
+    def enable_remote_tracking(self, config_path: Path, *, auto_fast_forward: bool) -> None:
+        raw = json.loads(config_path.read_text())
+        raw["remote_name"] = "origin"
+        raw["remote_head_required"] = True
+        raw["auto_fast_forward"] = auto_fast_forward
+        config_path.write_text(json.dumps(raw))
+        if raw["mode"] == "apply":
+            parsed_raw, parsed = load_config(config_path)
+            calibrate(
+                raw_config=parsed_raw,
+                routes=parsed.routes,
+                output=parsed.calibration_file,
+                ttl_seconds=600,
+            )
+
     def test_observe_plan_does_not_invoke_agent(self) -> None:
         temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="observe-plan")
         with temporary:
@@ -251,6 +289,163 @@ class ControllerTests(unittest.TestCase):
                 os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
             else:
                 os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_auto_fast_forward_rebinds_order_when_watched_paths_are_unchanged(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            writer = self.add_remote(root, repo)
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            old_sha = order["base_sha"]
+            order["follow_remote_main"] = True
+            order_path.write_text(json.dumps(order))
+            self.enable_remote_tracking(config_path, auto_fast_forward=True)
+            (writer / "src/unrelated.txt").write_text("remote\n")
+            self.git(writer, "add", "src/unrelated.txt")
+            self.git(writer, "commit", "-m", "remote unrelated change")
+            self.git(writer, "push", "origin", "main")
+            new_sha = current_sha(writer)
+
+            controller = FleetController(config_path=config_path)
+            controller.refresh_remote_base()
+
+            self.assertNotEqual(old_sha, new_sha)
+            self.assertEqual(current_sha(repo), new_sha)
+            self.assertEqual(json.loads(order_path.read_text())["base_sha"], new_sha)
+            event = controller.journal.verify()[-1]
+            self.assertEqual(event["kind"], "fleet.base.fast-forwarded")
+            self.assertEqual(event["fact"]["rebound_orders"], ["t_controller_1"])
+
+    def test_auto_fast_forward_holds_order_when_claimed_path_changed(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            writer = self.add_remote(root, repo)
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            old_sha = order["base_sha"]
+            order["follow_remote_main"] = True
+            order_path.write_text(json.dumps(order))
+            self.enable_remote_tracking(config_path, auto_fast_forward=True)
+            (writer / "src/ok.txt").write_text("remote changed subject\n")
+            self.git(writer, "add", "src/ok.txt")
+            self.git(writer, "commit", "-m", "remote claimed change")
+            self.git(writer, "push", "origin", "main")
+            new_sha = current_sha(writer)
+
+            controller = FleetController(config_path=config_path)
+            controller.refresh_remote_base()
+
+            self.assertEqual(current_sha(repo), new_sha)
+            self.assertEqual(json.loads(order_path.read_text())["base_sha"], old_sha)
+            event = controller.journal.verify()[-1]
+            self.assertEqual(event["kind"], "fleet.base.fast-forwarded")
+            self.assertEqual(event["fact"]["held_orders"], {"t_controller_1": "watched-path-changed"})
+
+    def test_observe_plan_reports_remote_drift_without_mutating(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="observe-plan")
+        with temporary:
+            writer = self.add_remote(root, repo)
+            self.enable_remote_tracking(config_path, auto_fast_forward=True)
+            old_sha = current_sha(repo)
+            (writer / "src/unrelated.txt").write_text("remote\n")
+            self.git(writer, "add", "src/unrelated.txt")
+            self.git(writer, "commit", "-m", "remote change")
+            self.git(writer, "push", "origin", "main")
+
+            result = FleetController(config_path=config_path).run_once()
+
+            self.assertEqual(current_sha(repo), old_sha)
+            self.assertFalse(result.plan.assignments)
+            self.assertFalse(result.observation.remote_in_sync)
+            reasons = [reason for row in result.plan.rejections for reason in row.reasons]
+            self.assertIn("remote-head-mismatch", reasons)
+
+    def test_required_remote_head_failure_blocks_dispatch(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="observe-plan")
+        with temporary:
+            self.enable_remote_tracking(config_path, auto_fast_forward=False)
+            result = FleetController(config_path=config_path).run_once()
+            self.assertFalse(result.plan.assignments)
+            self.assertIsNotNone(result.observation.remote_error)
+            reasons = [reason for row in result.plan.rejections for reason in row.reasons]
+            self.assertIn("remote-head-unavailable", reasons)
+
+    def test_remote_refresh_journals_local_subject_failure(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            self.add_remote(root, repo)
+            self.enable_remote_tracking(config_path, auto_fast_forward=True)
+            controller = FleetController(config_path=config_path)
+            with mock.patch("fleet_control.controller.current_sha", side_effect=GitRefusal("bad local subject")):
+                controller.refresh_remote_base()
+            event = controller.journal.verify()[-1]
+            self.assertEqual(event["kind"], "fleet.base.refresh-refused")
+            self.assertIsNone(event["fact"]["old_sha"])
+
+    def test_remote_refresh_refuses_work_order_directory_race(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            writer = self.add_remote(root, repo)
+            self.enable_remote_tracking(config_path, auto_fast_forward=True)
+            old_sha = current_sha(repo)
+            (writer / "src/unrelated.txt").write_text("remote\n")
+            self.git(writer, "add", "src/unrelated.txt")
+            self.git(writer, "commit", "-m", "remote change")
+            self.git(writer, "push", "origin", "main")
+            controller = FleetController(config_path=config_path)
+            with mock.patch.object(controller, "_load_work_orders", return_value=((), {})):
+                controller.refresh_remote_base()
+            self.assertEqual(current_sha(repo), old_sha)
+            event = controller.journal.verify()[-1]
+            self.assertEqual(event["kind"], "fleet.base.refresh-refused")
+            self.assertIn("work order changed during remote refresh", event["fact"]["error"])
+
+    def test_remote_rebind_rejects_changed_work_order_with_same_base(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            order_path = state / "work-orders/t_controller_1.json"
+            original = json.loads(order_path.read_text())
+            expected_hash = stable_hash(original)
+            changed = dict(original)
+            changed["path_claims"] = ["src/other.txt"]
+            order_path.write_text(json.dumps(changed))
+            with self.assertRaisesRegex(ControllerError, "changed before remote rebind"):
+                FleetController._write_rebound_order(
+                    order_path,
+                    old_sha=original["base_sha"],
+                    new_sha="f" * 40,
+                    expected_hash=expected_hash,
+                )
+
+    def test_rebind_failure_after_fast_forward_is_recorded_per_order(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            writer = self.add_remote(root, repo)
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            old_sha = order["base_sha"]
+            order["follow_remote_main"] = True
+            order_path.write_text(json.dumps(order))
+            self.enable_remote_tracking(config_path, auto_fast_forward=True)
+            (writer / "src/unrelated.txt").write_text("remote\n")
+            self.git(writer, "add", "src/unrelated.txt")
+            self.git(writer, "commit", "-m", "remote change")
+            self.git(writer, "push", "origin", "main")
+            new_sha = current_sha(writer)
+            controller = FleetController(config_path=config_path)
+            with mock.patch.object(
+                controller,
+                "_write_rebound_order",
+                side_effect=ControllerError("simulated concurrent replacement"),
+            ):
+                controller.refresh_remote_base()
+
+            self.assertEqual(current_sha(repo), new_sha)
+            self.assertEqual(json.loads(order_path.read_text())["base_sha"], old_sha)
+            event = controller.journal.verify()[-1]
+            self.assertEqual(event["kind"], "fleet.base.fast-forwarded")
+            self.assertEqual(event["fact"]["rebound_orders"], [])
+            self.assertIn("t_controller_1", event["fact"]["rebind_refusals"])
 
 
 if __name__ == "__main__":

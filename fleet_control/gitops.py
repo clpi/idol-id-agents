@@ -13,6 +13,8 @@ class GitRefusal(RuntimeError):
 
 
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +51,95 @@ def current_sha(repository: Path) -> str:
     if not _SHA_RE.fullmatch(value):
         raise GitRefusal("repository HEAD is not an exact SHA")
     return value
+
+
+def _branch_ref(branch: str) -> str:
+    if (
+        not _BRANCH_RE.fullmatch(branch)
+        or ".." in branch
+        or "//" in branch
+        or "@{" in branch
+        or branch.endswith(("/", ".", ".lock"))
+    ):
+        raise GitRefusal(f"invalid remote branch: {branch!r}")
+    return f"refs/heads/{branch}"
+
+
+def _remote(remote: str) -> str:
+    if not _REMOTE_RE.fullmatch(remote):
+        raise GitRefusal(f"invalid remote name: {remote!r}")
+    return remote
+
+
+def remote_branch_sha(repository: Path, *, remote: str, branch: str) -> str:
+    ref = _branch_ref(branch)
+    result = run(
+        repository,
+        ("ls-remote", "--exit-code", _remote(remote), ref),
+        timeout=30,
+    )
+    rows = [line.split() for line in result.stdout.splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref or not _SHA_RE.fullmatch(rows[0][0]):
+        raise GitRefusal(f"remote branch {remote}/{branch} did not resolve to one exact SHA")
+    return rows[0][0]
+
+
+def fetch_remote_branch(repository: Path, *, remote: str, branch: str) -> str:
+    ref = _branch_ref(branch)
+    remote_name = _remote(remote)
+    tracking_ref = f"refs/remotes/{remote_name}/{branch}"
+    run(
+        repository,
+        ("fetch", "--no-tags", "--quiet", remote_name, f"{ref}:{tracking_ref}"),
+        timeout=120,
+    )
+    value = run(repository, ("rev-parse", tracking_ref)).stdout.strip()
+    if not _SHA_RE.fullmatch(value):
+        raise GitRefusal(f"fetched branch {remote}/{branch} is not an exact SHA")
+    return value
+
+
+def current_branch(repository: Path) -> str:
+    value = run(repository, ("symbolic-ref", "--quiet", "--short", "HEAD")).stdout.strip()
+    _branch_ref(value)
+    return value
+
+
+def is_ancestor(repository: Path, ancestor: str, descendant: str) -> bool:
+    if not _SHA_RE.fullmatch(ancestor) or not _SHA_RE.fullmatch(descendant):
+        raise GitRefusal("ancestor check requires exact SHAs")
+    result = run(repository, ("merge-base", "--is-ancestor", ancestor, descendant), check=False)
+    if result.returncode not in {0, 1}:
+        raise GitRefusal(result.stdout.strip() or "git merge-base failed")
+    return result.returncode == 0
+
+
+def paths_changed(repository: Path, old: str, new: str, paths: Sequence[str]) -> bool:
+    if not _SHA_RE.fullmatch(old) or not _SHA_RE.fullmatch(new):
+        raise GitRefusal("path comparison requires exact SHAs")
+    if not paths:
+        raise GitRefusal("path comparison requires watched paths")
+    for path in paths:
+        _parts(path)
+    result = run(repository, ("diff", "--quiet", old, new, "--", *paths), check=False)
+    if result.returncode not in {0, 1}:
+        raise GitRefusal(result.stdout.strip() or "git path comparison failed")
+    return result.returncode == 1
+
+
+def fast_forward(repository: Path, *, branch: str, new_sha: str) -> None:
+    if current_branch(repository) != branch:
+        raise GitRefusal(f"authority worktree is not on {branch}")
+    old_sha = current_sha(repository)
+    if old_sha == new_sha:
+        return
+    if is_dirty(repository):
+        raise GitRefusal("authority worktree is dirty")
+    if not is_ancestor(repository, old_sha, new_sha):
+        raise GitRefusal("remote branch is not a fast-forward of the authority worktree")
+    run(repository, ("merge", "--ff-only", new_sha), timeout=180)
+    if current_sha(repository) != new_sha or is_dirty(repository):
+        raise GitRefusal("authority worktree did not reach the clean fetched SHA")
 
 
 def require_exact_subject(repository: Path, expected_sha: str) -> None:
