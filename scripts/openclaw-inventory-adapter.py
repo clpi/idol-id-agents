@@ -244,6 +244,23 @@ def selected_environment(path: Path) -> Mapping[str, str]:
     return result
 
 
+def process_actor(arguments: Sequence[str]) -> str | None:
+    names = {Path(part).name for part in arguments[:3]}
+    if "hermes" in names and "chat" in arguments:
+        return "hermes-cli"
+    if names & {"claude", "claude-code"}:
+        return "claude-cli"
+    if names & {"kiro-cli", "kiro-cli-chat"}:
+        return "kiro-cli"
+    if names & {"kimi", "kimi-code"}:
+        return "kimi-cli"
+    if "codex" in names:
+        return "codex-cli"
+    if names & {"opencode", "opencode-cli"}:
+        return "opencode-cli"
+    return None
+
+
 def process_sessions(observed_at: float) -> list[Mapping[str, Any]]:
     rows: list[Mapping[str, Any]] = []
     proc = Path("/proc")
@@ -261,18 +278,7 @@ def process_sessions(observed_at: float) -> list[Mapping[str, Any]]:
             ]
         except OSError:
             continue
-        names = {Path(part).name for part in arguments[:3]}
-        actor = None
-        if "hermes" in names and "chat" in arguments:
-            actor = "hermes-cli"
-        elif names & {"claude", "claude-code"}:
-            actor = "claude-cli"
-        elif names & {"kiro-cli", "kiro-cli-chat"}:
-            actor = "kiro-cli"
-        elif "codex" in names:
-            actor = "codex-cli"
-        elif names & {"opencode", "opencode-cli"}:
-            actor = "opencode-cli"
+        actor = process_actor(arguments)
         if actor is None:
             continue
         environment = selected_environment(directory / "environ")
