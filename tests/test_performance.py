@@ -45,6 +45,17 @@ class PerformanceTests(unittest.TestCase):
             },
             at=1,
         )
+        journal.append(
+            "attempt.ready",
+            {
+                "attempt_id":"attempt-one",
+                "order_id":"order-one",
+                "task_id":"task-one",
+                "route_id":"route-one",
+                "commit":"a" * 40,
+            },
+            at=2,
+        )
         return journal
 
     def test_admitted_outcome_requires_independent_family(self) -> None:
@@ -81,6 +92,32 @@ class PerformanceTests(unittest.TestCase):
     def test_unknown_attempt_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             journal = Journal(Path(temporary) / "history.jsonl")
+            with self.assertRaises(OutcomeRefusal):
+                record_outcome(journal, self.receipt())
+
+    def test_admitted_outcome_requires_matching_ready_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = self.journal(Path(temporary))
+            with self.assertRaises(OutcomeRefusal):
+                record_outcome(
+                    journal,
+                    self.receipt(accepted_commit="b" * 40),
+                    route_families={"route-one":"openai"},
+                )
+
+    def test_outcome_requires_ready_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            journal = Journal(Path(temporary) / "history.jsonl")
+            journal.append(
+                "attempt.started",
+                {
+                    "attempt_id":"attempt-one",
+                    "order_id":"order-one",
+                    "task_id":"task-one",
+                    "route_id":"route-one",
+                },
+                at=1,
+            )
             with self.assertRaises(OutcomeRefusal):
                 record_outcome(journal, self.receipt())
 

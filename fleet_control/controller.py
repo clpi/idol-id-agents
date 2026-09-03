@@ -296,13 +296,12 @@ class FleetController:
         }
         return frozenset(order_id for order_id, kind in state.items() if kind in held)
 
-    def _attempt_index(self, order_id: str, route_id: str) -> int:
+    def _attempt_index(self, order_id: str) -> int:
         return sum(
             1
             for row in self.journal.events({"attempt.started"})
             if isinstance(row.get("fact"), Mapping)
             and row["fact"].get("order_id") == order_id
-            and row["fact"].get("route_id") == route_id
         )
 
     def plan(self, observation: Observation, orders: Sequence[WorkOrder], routes: Sequence[Route]) -> Plan:
@@ -481,7 +480,7 @@ class FleetController:
         work_item = f"work-{stable_hash(order.task_id)[:16]}"
         repository_subject = stable_hash(str(self.config.repository.resolve()))[:16]
         path_targets = tuple(f"{repository_subject}/{path}" for path in order.path_claims)
-        attempt_index = self._attempt_index(order.id, route.id)
+        attempt_index = self._attempt_index(order.id)
         attempt_id = stable_hash(
             {
                 "order": order.id,
@@ -585,6 +584,7 @@ class FleetController:
                     worktree,
                     renew_claims=renew_claims,
                 )
+                paths = require_claimed_changes(worktree, order.path_claims)
                 commit = commit_claimed(
                     repository=worktree,
                     paths=paths,

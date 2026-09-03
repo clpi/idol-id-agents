@@ -58,6 +58,11 @@ class PolicyTests(unittest.TestCase):
         route = replace(route, proof=replace(route.proof, kind="trust-me"))
         self.assertFalse(route_verdict(route, now=50).allowed)
 
+    def test_exact_zero_cost_model_proof_is_allowed_for_included_route(self) -> None:
+        route = self.route(BillingClass.INCLUDED)
+        route = replace(route, proof=replace(route.proof, kind="zero-cost-model"))
+        self.assertTrue(route_verdict(route, now=50).allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

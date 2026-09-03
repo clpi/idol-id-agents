@@ -15,6 +15,7 @@ _ALLOWED_PROOF_KINDS = frozenset({
     "local-process",
     "subscription-oauth",
     "subscription-plan",
+    "zero-cost-model",
 })
 
 

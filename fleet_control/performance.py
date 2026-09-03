@@ -86,6 +86,7 @@ def record_outcome(
     route_families: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any]:
     attempt: Mapping[str, Any] | None = None
+    ready: Mapping[str, Any] | None = None
     implementer_family: str | None = None
     existing_verdict: str | None = None
     for row in journal.events():
@@ -96,6 +97,8 @@ def record_outcome(
             continue
         if row.get("kind") == "attempt.started":
             attempt = fact
+        if row.get("kind") == "attempt.ready":
+            ready = fact
         if row.get("kind") == "attempt.executed":
             implementer_family = str(fact.get("provider_family") or "") or None
         if row.get("kind") in {"attempt.admitted", "attempt.rejected", "attempt.reverted"}:
@@ -111,6 +114,10 @@ def record_outcome(
             raise OutcomeRefusal(f"outcome {key} does not match the attempt")
     if existing_verdict is not None:
         raise OutcomeRefusal(f"attempt already has terminal outcome {existing_verdict}")
+    if ready is None:
+        raise OutcomeRefusal("outcome references an attempt that is not ready")
+    if receipt.verdict == "admitted" and ready.get("commit") != receipt.accepted_commit:
+        raise OutcomeRefusal("accepted commit does not match the ready candidate")
     configured_family = (route_families or {}).get(receipt.route_id)
     if implementer_family and configured_family and implementer_family != configured_family:
         raise OutcomeRefusal("executed provider family differs from configured route family")

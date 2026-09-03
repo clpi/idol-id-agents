@@ -83,6 +83,30 @@ class RuntimeTests(unittest.TestCase):
         with temporary, self.assertRaises(RuntimeRefusal):
             runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository)
 
+    def test_openclaw_identity_is_mandatory(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script(
+            "import json; print(json.dumps({'status':'ok','costUsd':0}))"
+        )
+        route = replace(route, parser="openclaw-json")
+        route = replace(route, proof=replace(route.proof, subject_hash=route.subject_hash))
+        with temporary, self.assertRaises(RuntimeRefusal):
+            runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository)
+
+    def test_prompt_metacharacters_are_one_inert_argument(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script(
+            "import json, sys; print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'usage':{'argument':sys.argv[1]}}))"
+        )
+        with temporary:
+            marker = Path(temporary.name) / "must-not-exist"
+            value = f"$(touch {marker})\n; touch {marker}"
+            prompt.write_text(value)
+            route = replace(route, command=(*route.command, "{prompt_text}"))
+            route = replace(route, proof=replace(route.proof, subject_hash=route.subject_hash))
+            order = replace(order, route_ids=(route.id,))
+            result = runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository)
+            self.assertEqual(result.usage["argument"], value)
+            self.assertFalse(marker.exists())
+
     def test_positive_cost_on_local_route_refuses(self) -> None:
         temporary, runtime, route, order, prompt = self.execute_script(
             "import json; print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0.01}))"

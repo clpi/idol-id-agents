@@ -218,6 +218,40 @@ class ControllerTests(unittest.TestCase):
             reasons = [reason for row in result.plan.rejections for reason in row.reasons]
             self.assertIn("attempt-already-active", reasons)
 
+    def test_retry_index_is_shared_across_fallback_routes(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="observe-plan")
+        with temporary:
+            controller = FleetController(config_path=config_path)
+            controller.journal.append(
+                "attempt.started",
+                {"order_id": "t_controller_1", "route_id": "first-route"},
+            )
+            self.assertEqual(controller._attempt_index("t_controller_1"), 1)
+
+    def test_witness_outside_claim_is_refused(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        order_path = state / "work-orders/t_controller_1.json"
+        order = json.loads(order_path.read_text())
+        order["witnesses"] = [[
+            "python3",
+            "-c",
+            "from pathlib import Path; Path('outside-from-witness.txt').write_text('bad')",
+        ]]
+        order_path.write_text(json.dumps(order))
+        old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+        os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+        try:
+            with temporary:
+                result = FleetController(config_path=config_path).run_once()
+                attempt = result.attempts[0]
+                self.assertEqual(attempt["error_type"], "GitRefusal")
+                self.assertNotIn("commit", attempt)
+        finally:
+            if old is None:
+                os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+            else:
+                os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
 
 if __name__ == "__main__":
     unittest.main()

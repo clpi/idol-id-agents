@@ -103,7 +103,12 @@ def _probe_route(route: Route, *, ttl_seconds: int, now: float) -> BillingProof:
     if not matched:
         raise CalibrationError(f"route {route.id} proof did not establish the configured account class")
     proof_kind = route.proof.kind
-    if proof_kind not in {"local-process", "subscription-oauth", "subscription-plan"}:
+    if proof_kind not in {
+        "local-process",
+        "subscription-oauth",
+        "subscription-plan",
+        "zero-cost-model",
+    }:
         raise CalibrationError(f"route {route.id} has unsupported proof kind {proof_kind!r}")
     evidence = {
         "route_subject": route.subject_hash,

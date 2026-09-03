@@ -131,16 +131,18 @@ class CommandRuntime:
         session = payload.get("sessionId") or payload.get("session_id")
         if returncode != 0 or status.lower() not in {"ok", "success", "completed"}:
             raise RuntimeRefusal(f"OpenClaw route failed: status={status!r} returncode={returncode}")
-        if provider and provider != route.provider:
+        if not provider or not model:
+            raise RuntimeRefusal("OpenClaw route omitted provider/model identity")
+        if provider != route.provider:
             raise RuntimeRefusal(f"provider mismatch: expected {route.provider!r}, observed {provider!r}")
-        if model and model != route.model:
+        if model != route.model:
             raise RuntimeRefusal(f"model mismatch: expected {route.model!r}, observed {model!r}")
         if route.billing is BillingClass.LOCAL and cost not in {None, 0.0}:
             raise RuntimeRefusal("local route reported positive model cost")
         return RunResult(
             route_id=route.id,
-            provider=provider or route.provider,
-            model=model or route.model,
+            provider=provider,
+            model=model,
             status=status,
             returncode=returncode,
             started_at=started_at,
