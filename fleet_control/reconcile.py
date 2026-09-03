@@ -11,6 +11,7 @@ _TERMINAL = frozenset({
     "attempt.refused",
     "attempt.failed",
     "attempt.cancelled",
+    "attempt.no-change",
 })
 
 
@@ -31,6 +32,7 @@ def reconcile_expired_attempts(controller: FleetController, *, now: float | None
             "attempt.refused",
             "attempt.failed",
             "attempt.cancelled",
+            "attempt.no-change",
         }
     ):
         fact = row.get("fact")

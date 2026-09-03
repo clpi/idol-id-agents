@@ -206,6 +206,7 @@ class WorkOrder:
     publish_branch: bool = True
     create_draft_pr: bool = True
     follow_remote_main: bool = False
+    allow_no_change: bool = False
 
     def __post_init__(self) -> None:
         for label, value in (("work-order id", self.id), ("task id", self.task_id), ("role", self.role)):
@@ -236,6 +237,8 @@ class WorkOrder:
             raise ValueError("estimated_seconds outside supported bounds")
         if self.estimated_tokens < 1:
             raise ValueError("estimated_tokens must be positive")
+        if self.allow_no_change and self.role not in {"counterexample", "evidence", "observer", "reviewer"}:
+            raise ValueError("allow_no_change is limited to evidence-producing roles")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "WorkOrder":
@@ -271,6 +274,7 @@ class WorkOrder:
             publish_branch=raw.get("publish_branch", True) is True,
             create_draft_pr=raw.get("create_draft_pr", True) is True,
             follow_remote_main=raw.get("follow_remote_main", False) is True,
+            allow_no_change=raw.get("allow_no_change", False) is True,
         )
 
 

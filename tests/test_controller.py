@@ -216,6 +216,97 @@ class ControllerTests(unittest.TestCase):
             else:
                 os.environ["IDOL_TEST_CLAIM_LOG"] = old
 
+    def test_explicit_evidence_order_can_finish_with_witnessed_no_change(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            agent.write_text(
+                "import json\n"
+                "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'usage':{'tokens':1}}))\n"
+            )
+            config = json.loads(config_path.read_text())
+            config["routes"][0]["roles"].append("evidence")
+            config_path.write_text(json.dumps(config))
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            order["role"] = "evidence"
+            order["required_outcome"] = "Prove whether the exact subject already satisfies the bounded claim."
+            order["allow_no_change"] = True
+            order["witnesses"] = [
+                ["python3", "-c", "from pathlib import Path; assert Path('src/ok.txt').read_text() == 'base\\n'"]
+            ]
+            order_path.write_text(json.dumps(order))
+            raw, parsed = load_config(config_path)
+            calibrate(raw_config=raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
+            old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+            os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+            try:
+                controller = FleetController(config_path=config_path)
+                result = controller.run_once()
+                self.assertEqual(len(result.attempts), 1)
+                self.assertEqual(result.attempts[0]["paths"], ())
+                self.assertNotIn("commit", result.attempts[0])
+                self.assertEqual(controller.journal.verify()[-2]["kind"], "attempt.no-change")
+                self.assertFalse(controller.run_once().attempts)
+            finally:
+                if old is None:
+                    os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+                else:
+                    os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_empty_implementation_attempt_still_refuses(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            agent.write_text(
+                "import json\n"
+                "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'usage':{'tokens':1}}))\n"
+            )
+            old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+            os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+            try:
+                controller = FleetController(config_path=config_path)
+                result = controller.run_once()
+                self.assertEqual(result.attempts[0]["error"], "attempt produced no changed files")
+                self.assertEqual(controller.journal.verify()[-2]["kind"], "attempt.refused")
+            finally:
+                if old is None:
+                    os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+                else:
+                    os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_no_change_refuses_an_agent_committed_head_move(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            agent.write_text(
+                "import json, pathlib, subprocess, sys\n"
+                "cwd=pathlib.Path(sys.argv[1])\n"
+                "(cwd/'src/ok.txt').write_text('committed\\n')\n"
+                "subprocess.run(['git','add','src/ok.txt'],cwd=cwd,check=True)\n"
+                "subprocess.run(['git','-c','user.name=test','-c','user.email=test@example.com','commit','-m','agent commit'],cwd=cwd,check=True)\n"
+                "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'usage':{'tokens':1}}))\n"
+            )
+            config = json.loads(config_path.read_text())
+            config["routes"][0]["roles"].append("evidence")
+            config_path.write_text(json.dumps(config))
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            order["role"] = "evidence"
+            order["allow_no_change"] = True
+            order_path.write_text(json.dumps(order))
+            raw, parsed = load_config(config_path)
+            calibrate(raw_config=raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
+            old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+            os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+            try:
+                controller = FleetController(config_path=config_path)
+                result = controller.run_once()
+                self.assertIn("stale work order", result.attempts[0]["error"])
+                self.assertEqual(controller.journal.verify()[-2]["kind"], "attempt.refused")
+            finally:
+                if old is None:
+                    os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+                else:
+                    os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
     def test_outside_path_edit_is_refused_and_preserved(self) -> None:
         temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply", outside=True)
         old = os.environ.get("IDOL_TEST_CLAIM_LOG")

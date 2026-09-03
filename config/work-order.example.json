@@ -32,5 +32,6 @@
   "issue": "https://github.com/clpi/idol/issues/000",
   "publish_branch": true,
   "create_draft_pr": true,
-  "follow_remote_main": false
+  "follow_remote_main": false,
+  "allow_no_change": false
 }

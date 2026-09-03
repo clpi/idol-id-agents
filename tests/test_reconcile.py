@@ -87,6 +87,13 @@ class ReconcileTests(unittest.TestCase):
             controller.journal.append("attempt.refused", {"order_id":"one"}, at=20)
             self.assertFalse(reconcile_expired_attempts(controller, now=100))
 
+    def test_no_change_attempt_is_terminal(self) -> None:
+        temporary, controller = self.fixture()
+        with temporary:
+            controller.journal.append("attempt.started", {"order_id":"one"}, at=10)
+            controller.journal.append("attempt.no-change", {"order_id":"one"}, at=20)
+            self.assertFalse(reconcile_expired_attempts(controller, now=100))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -161,6 +161,7 @@ class ManagedFleetController(FleetController):
             "attempt.refused",
             "attempt.failed",
             "attempt.cancelled",
+            "attempt.no-change",
             "attempt.admitted",
             "attempt.rejected",
             "attempt.reverted",
