@@ -85,52 +85,32 @@ def openclaw_command() -> list[str]:
 
 def call(method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
     executable = openclaw_command()
-    commands = []
-    if params is None:
-        commands.extend(
-            (
-                [*executable, "gateway", "call", method, "--json"],
-                [*executable, "gateway", "call", method, "--format", "json"],
-            )
+    command = [*executable, "gateway", "call", method]
+    if params is not None:
+        command.extend(("--params", json.dumps(params, sort_keys=True, separators=(",", ":"))))
+    command.extend(("--json", "--timeout", "5000"))
+    try:
+        result = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=8,
+            check=False,
         )
-    else:
-        encoded = json.dumps(params, sort_keys=True, separators=(",", ":"))
-        commands.extend(
-            (
-                [*executable, "gateway", "call", method, "--params", encoded, "--json"],
-                [*executable, "gateway", "call", method, "--params-json", encoded, "--format", "json"],
-                [*executable, "gateway", "call", method, "--json"],
-                [*executable, "gateway", "call", method, "--format", "json"],
-            )
-        )
-    errors = []
-    for command in commands:
-        try:
-            result = subprocess.run(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            errors.append(f"{command!r}: {type(exc).__name__}")
-            continue
-        if result.returncode != 0:
-            errors.append(f"{command!r}: exit {result.returncode}")
-            continue
-        raw = json_object(result.stdout[:4_000_000])
-        # Gateway CLIs may wrap the method payload.
-        for key in ("payload", "result", "data"):
-            candidate = raw.get(key)
-            if isinstance(candidate, Mapping):
-                raw = candidate
-                break
-        reject_content(raw)
-        return raw
-    raise RuntimeError(f"no read-only gateway call form succeeded for {method}: {'; '.join(errors)}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"read-only gateway call did not complete for {method}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"read-only gateway call returned {result.returncode} for {method}")
+    raw = json_object(result.stdout[:4_000_000])
+    for key in ("payload", "result", "data"):
+        candidate = raw.get(key)
+        if isinstance(candidate, Mapping):
+            raw = candidate
+            break
+    reject_content(raw)
+    return raw
 
 
 def rows(raw: Mapping[str, Any], keys: Sequence[str]) -> Sequence[Any]:
@@ -198,11 +178,13 @@ def session_row(value: Any) -> Mapping[str, Any] | None:
     meta = metadata(value)
     session_id = pick(value, "id", "sessionId", "session_id", "key")
     status = pick(value, "status", "state", "phase")
+    if status is None and value.get("hasActiveRun") is True:
+        status = "running"
     if session_id is None or status is None:
         return None
     usage = value.get("usage") if isinstance(value.get("usage"), Mapping) else {}
     model = pick(value, "model", "modelId", "model_id") or pick(usage, "model", "modelId")
-    provider = pick(value, "provider", "providerId", "provider_id") or pick(usage, "provider", "providerId")
+    provider = pick(value, "provider", "providerId", "provider_id", "modelProvider") or pick(usage, "provider", "providerId")
     row = {
         "id": str(session_id),
         "status": str(status).lower(),
@@ -316,26 +298,50 @@ def process_sessions(observed_at: float) -> list[Mapping[str, Any]]:
     return rows
 
 
+def emit_inventory(
+    *,
+    observed_at: float,
+    source: str,
+    sessions: Sequence[Mapping[str, Any]],
+    agents: Sequence[Mapping[str, Any]],
+) -> None:
+    print(
+        json.dumps(
+            {
+                "schema": "idol.fleet.inventory.v1",
+                "observed_at": observed_at,
+                "source": source,
+                "sessions": sessions,
+                "agents": agents,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
 def main() -> int:
     try:
-        sessions_raw = call("sessions.list", {"limit": 1000, "ownerFirst": True})
-        agents_raw = call("agents.list")
         observed_at = time.time()
-        sessions = [row for item in rows(sessions_raw, ("sessions", "items")) if (row := session_row(item))]
-        sessions.extend(process_sessions(observed_at))
-        agents = [row for item in rows(agents_raw, ("agents", "items")) if (row := agent_row(item))]
-        print(
-            json.dumps(
-                {
-                    "schema": "idol.fleet.inventory.v1",
-                    "observed_at": observed_at,
-                    "source": "openclaw-local-gateway",
-                    "sessions": sessions,
-                    "agents": agents,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
+        processes = process_sessions(observed_at)
+        if any(not row.get("order_id") and not row.get("task_id") for row in processes):
+            emit_inventory(
+                observed_at=observed_at,
+                source="local-process-fast-fence",
+                sessions=processes,
+                agents=(),
             )
+            return 0
+        sessions_raw = call("sessions.list", {"limit": 10})
+        agents_raw = call("agents.list")
+        sessions = [row for item in rows(sessions_raw, ("sessions", "items")) if (row := session_row(item))]
+        sessions.extend(processes)
+        agents = [row for item in rows(agents_raw, ("agents", "items")) if (row := agent_row(item))]
+        emit_inventory(
+            observed_at=observed_at,
+            source="openclaw-local-gateway",
+            sessions=sessions,
+            agents=agents,
         )
         return 0
     except Exception as exc:
