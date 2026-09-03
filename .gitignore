@@ -1,3 +1,5 @@
 *.env
 .env.*
 shared-env
+__pycache__/
+*.py[cod]

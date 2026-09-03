@@ -1,0 +1,84 @@
+name: Verify fleet controller without inference
+
+on:
+  push:
+    branches: [main, "ops/**"]
+    paths:
+      - fleet_control/**
+      - tests/**
+      - scripts/idol-fleet
+      - scripts/hermes-route-proof.py
+      - scripts/hermes-usage-adapter.py
+      - scripts/zai-usage-adapter.py
+      - scripts/openclaw-inventory-adapter.py
+      - scripts/install-fleet-observer.sh
+      - scripts/install-fleet-observer-systemd.sh
+      - scripts/install-fleet-systemd.sh
+      - config/fleet.example.json
+      - config/work-order.example.json
+      - .github/workflows/fleet-controller-verify.yml
+  pull_request:
+    paths:
+      - fleet_control/**
+      - tests/**
+      - scripts/idol-fleet
+      - scripts/hermes-route-proof.py
+      - scripts/hermes-usage-adapter.py
+      - scripts/zai-usage-adapter.py
+      - scripts/openclaw-inventory-adapter.py
+      - scripts/install-fleet-observer.sh
+      - scripts/install-fleet-observer-systemd.sh
+      - scripts/install-fleet-systemd.sh
+      - config/fleet.example.json
+      - config/work-order.example.json
+      - .github/workflows/fleet-controller-verify.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: idol-fleet-controller-verify
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IDOL_FLEET_NO_PAYGO: "1"
+      IDOL_FLEET_NO_MODEL_INFERENCE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile controller
+        run: python3 -m compileall -q fleet_control tests
+      - name: Run fail-closed controller tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Prove example routes are disabled and non-pay-go
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          raw=json.loads(Path('config/fleet.example.json').read_text())
+          assert raw['mode'] == 'observe-plan'
+          for route in raw['routes']:
+              assert route['enabled'] is False
+              assert route['billing'] in {'local', 'included'}
+              assert route['proof']['trusted'] is False
+          print('example configuration is inert until local calibration')
+          PY
+      - name: Verify installer cannot enable apply
+        run: |
+          grep -F -- '--mode observe-plan' scripts/install-fleet-observer.sh
+          grep -F -- '--mode observe-plan' scripts/install-fleet-observer-systemd.sh
+          if grep -nEi 'consume_usage_reset|redeem[^[:space:]]*.*reset|purchase[^[:space:]]*.*credit|enable[^[:space:]]*.*paygo|paygo_approved[^[:space:]]*true' scripts/install-fleet*.sh; then
+            echo 'forbidden automatic spending surface found' >&2
+            exit 1
+          fi

@@ -1,11 +1,14 @@
 # idol-id-agents
 
-Portable agent setup for the Idol platform Pis (r8a / r16 / r8b) and Mac mini.
+Portable agent setup and the fail-closed continuity controller for IDOL and LIVE hosts.
 
 ## Contents
 - `scripts/bootstrap.sh` — one-liner to install all agents on a fresh Pi/Mac
 - `config/.shared-env.template` — env template (copy to `~/.shared-env` and fill in keys)
 - `config/agents/` — per-agent config snippets
+- `fleet_control/` — quota-aware, claim-safe continuous work controller
+- `docs/FLEET_CONTROLLER.md` — controller law, deployment, and deletion witness
+- `scripts/discover-fleet-host.py` — no-inference host and provider discovery
 
 ## Bootstrap
 ```bash
@@ -24,3 +27,11 @@ curl -fsSL https://raw.githubusercontent.com/clpi/idol-id-agents/main/scripts/bo
 
 ## Security
 Never commit real API keys. Use `~/.shared-env` locally (gitignored) or a secrets manager.
+
+## Continuous development
+
+The production controller uses exact-SHA work orders, two claim layers, live
+session inventory, fixed-cost route proofs, allowance snapshots, per-provider
+circuit breakers, and independent admission receipts. It never enables PAYG,
+redeems resets, or merges its own attempts. Start with the inert example and
+follow [the fleet controller guide](docs/FLEET_CONTROLLER.md).
