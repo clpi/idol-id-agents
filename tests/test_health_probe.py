@@ -80,6 +80,37 @@ def controller_fixture(root, expires_at=200, mode="apply"):
 
 
 class EndpointTests(unittest.TestCase):
+    def test_controller_manager_selects_only_the_configured_units(self):
+        for manager in ("user", "system"):
+            with self.subTest(manager=manager):
+                calls = []
+                def runner(command, **kwargs):
+                    calls.append(command)
+                    return response()
+                with mock.patch.dict(os.environ, {"IDOL_HEALTH_FLEET_MANAGER": manager}):
+                    result = health_probe.services(runner)
+                for name in ("idol-fleet-idol.service", "idol-fleet-live.service"):
+                    matching = [command for command in calls if name in command]
+                    self.assertEqual(len(matching), 1)
+                    self.assertEqual("--user" in matching[0], manager == "user")
+                tunnel = next(command for command in calls if "r16-tunnel.service" in command)
+                self.assertIn("--user", tunnel)
+                self.assertEqual(result["idol_fleet_idol"]["manager"], manager)
+                self.assertFalse(result["idol_fleet_idol"]["healthy"])
+
+    def test_invalid_controller_manager_never_probes_a_different_manager(self):
+        calls = []
+        def runner(command, **kwargs):
+            calls.append(command)
+            return response()
+        with mock.patch.dict(os.environ, {"IDOL_HEALTH_FLEET_MANAGER": "invalid"}):
+            result = health_probe.services(runner)
+        self.assertFalse(any("idol-fleet-idol.service" in command for command in calls))
+        self.assertFalse(any("idol-fleet-live.service" in command for command in calls))
+        for key in ("idol_fleet_idol", "idol_fleet_live"):
+            self.assertFalse(result[key]["healthy"])
+            self.assertEqual(result[key]["status"], "invalid_manager")
+
     def test_services_use_two_bounded_systemctl_show_calls(self):
         calls = []
         def runner(command, **kwargs):
