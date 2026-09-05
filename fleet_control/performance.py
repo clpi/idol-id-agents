@@ -42,31 +42,48 @@ class OutcomeReceipt:
             route_id=str(raw.get("route_id", "")).strip(),
             verdict=str(raw.get("verdict", "")).strip().lower(),
             accepted_commit=str(raw.get("accepted_commit", "")).strip() or None,
-            reviewer_families=tuple(str(item).strip() for item in reviewers),
+            reviewer_families=tuple(reviewers),
             semantic_increment=float(raw.get("semantic_increment", 0)),
             accepted_tokens=int(raw.get("accepted_tokens", 0)),
             defects=int(raw.get("defects", 0)),
             observed_at=float(raw.get("observed_at", 0)),
             evidence=str(raw.get("evidence", "")).strip(),
         )
-        if receipt.schema != "idol.fleet.outcome.v1":
-            raise OutcomeRefusal("outcome schema mismatch")
-        if not all((receipt.attempt_id, receipt.order_id, receipt.task_id, receipt.route_id, receipt.evidence)):
-            raise OutcomeRefusal("outcome lacks identity or evidence")
-        if receipt.verdict not in {"admitted", "rejected", "reverted"}:
-            raise OutcomeRefusal("outcome verdict is not closed")
-        if receipt.semantic_increment < 0 or receipt.semantic_increment > 100:
-            raise OutcomeRefusal("semantic_increment outside supported bounds")
-        if receipt.accepted_tokens < 0 or receipt.defects < 0:
-            raise OutcomeRefusal("outcome tokens/defects cannot be negative")
-        if receipt.verdict == "admitted":
-            if receipt.accepted_commit is None or len(receipt.accepted_commit) != 40:
-                raise OutcomeRefusal("admitted outcome lacks exact commit")
-            if not receipt.reviewer_families:
-                raise OutcomeRefusal("admitted outcome lacks independent reviewer evidence")
-            if receipt.semantic_increment <= 0 or receipt.accepted_tokens <= 0:
-                raise OutcomeRefusal("admitted outcome lacks measured progress/tokens")
+        _validate_receipt(receipt)
         return receipt
+
+
+def _validate_receipt(receipt: OutcomeReceipt) -> None:
+    if receipt.schema != "idol.fleet.outcome.v1":
+        raise OutcomeRefusal("outcome schema mismatch")
+    if not all((receipt.attempt_id, receipt.order_id, receipt.task_id, receipt.route_id, receipt.evidence)):
+        raise OutcomeRefusal("outcome lacks identity or evidence")
+    if receipt.verdict not in {"admitted", "rejected", "reverted"}:
+        raise OutcomeRefusal("outcome verdict is not closed")
+    if not math.isfinite(receipt.semantic_increment):
+        raise OutcomeRefusal("semantic_increment must be finite")
+    if receipt.semantic_increment < 0 or receipt.semantic_increment > 100:
+        raise OutcomeRefusal("semantic_increment outside supported bounds")
+    if not math.isfinite(receipt.observed_at):
+        raise OutcomeRefusal("observed_at must be finite")
+    if receipt.accepted_tokens < 0 or receipt.defects < 0:
+        raise OutcomeRefusal("outcome tokens/defects cannot be negative")
+    if isinstance(receipt.reviewer_families, (str, bytes)) or not isinstance(
+        receipt.reviewer_families, Sequence
+    ):
+        raise OutcomeRefusal("reviewer_families must be an array")
+    if any(
+        not isinstance(family, str) or not family.strip() or family != family.strip()
+        for family in receipt.reviewer_families
+    ):
+        raise OutcomeRefusal("reviewer_families must contain canonical non-empty names")
+    if receipt.verdict == "admitted":
+        if receipt.accepted_commit is None or len(receipt.accepted_commit) != 40:
+            raise OutcomeRefusal("admitted outcome lacks exact commit")
+        if not receipt.reviewer_families:
+            raise OutcomeRefusal("admitted outcome lacks independent reviewer evidence")
+        if receipt.semantic_increment <= 0 or receipt.accepted_tokens <= 0:
+            raise OutcomeRefusal("admitted outcome lacks measured progress/tokens")
 
 
 def load_receipt(path: Path) -> OutcomeReceipt:
@@ -85,6 +102,7 @@ def record_outcome(
     *,
     route_families: Mapping[str, str] | None = None,
 ) -> Mapping[str, Any]:
+    _validate_receipt(receipt)
     attempt: Mapping[str, Any] | None = None
     ready: Mapping[str, Any] | None = None
     implementer_family: str | None = None

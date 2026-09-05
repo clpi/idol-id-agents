@@ -10,6 +10,7 @@ CONFIG=$1
 case "$CONFIG" in /*) ;; *) echo "configuration path must be absolute" >&2; exit 2 ;; esac
 [ -f "$CONFIG" ] || { echo "configuration not found: $CONFIG" >&2; exit 2; }
 [ "$(uname -s)" = Linux ] || { echo "this installer is for Linux systemd --user" >&2; exit 2; }
+RECOVERY_POLICY=$("$ROOT/scripts/fleet-systemd-recovery.sh")
 PYTHON=${PYTHON:-$(command -v python3)}
 [ -n "$PYTHON" ] || { echo "python3 not found" >&2; exit 2; }
 
@@ -27,9 +28,11 @@ if not path.is_absolute(): raise SystemExit('state_dir must be absolute after ex
 print(path)
 PY
 )
-mkdir -p "$STATE/logs" "$HOME/.config/systemd/user"
-chmod 700 "$STATE" "$STATE/logs"
 UNIT="$HOME/.config/systemd/user/idol-fleet-observe.service"
+RECOVERY_DIR="$HOME/.config/systemd/user/idol-fleet-observe.service.d"
+RECOVERY_UNIT="$RECOVERY_DIR/40-restart-backoff.conf"
+mkdir -p "$STATE/logs" "$HOME/.config/systemd/user" "$RECOVERY_DIR"
+chmod 700 "$STATE" "$STATE/logs"
 cat > "$UNIT" <<EOF
 [Unit]
 Description=IDOL and LIVE fleet observe-plan controller
@@ -55,7 +58,8 @@ StandardError=append:$STATE/logs/observe.stderr.log
 [Install]
 WantedBy=default.target
 EOF
-chmod 600 "$UNIT"
+printf '%s\n' "$RECOVERY_POLICY" > "$RECOVERY_UNIT"
+chmod 600 "$UNIT" "$RECOVERY_UNIT"
 systemctl --user daemon-reload
 systemctl --user enable --now idol-fleet-observe.service
 systemctl --user --no-pager --full status idol-fleet-observe.service | sed -n '1,80p'
