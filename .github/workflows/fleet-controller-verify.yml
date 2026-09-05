@@ -6,6 +6,7 @@ on:
     paths:
       - fleet_control/**
       - tests/**
+      - plugins/openclaw-fleet-snapshot/**
       - scripts/idol-fleet
       - scripts/idol-dev
       - scripts/fleet_health_probe.py
@@ -16,6 +17,7 @@ on:
       - scripts/zai-usage-adapter.py
       - scripts/openclaw-inventory-adapter.py
       - scripts/codex_inventory.py
+      - scripts/openclaw_transport.py
       - scripts/install-fleet-observer.sh
       - scripts/install-fleet-observer-systemd.sh
       - scripts/install-fleet-systemd.sh
@@ -26,6 +28,7 @@ on:
     paths:
       - fleet_control/**
       - tests/**
+      - plugins/openclaw-fleet-snapshot/**
       - scripts/idol-fleet
       - scripts/idol-dev
       - scripts/fleet_health_probe.py
@@ -36,6 +39,7 @@ on:
       - scripts/zai-usage-adapter.py
       - scripts/openclaw-inventory-adapter.py
       - scripts/codex_inventory.py
+      - scripts/openclaw_transport.py
       - scripts/install-fleet-observer.sh
       - scripts/install-fleet-observer-systemd.sh
       - scripts/install-fleet-systemd.sh
@@ -67,9 +71,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Compile controller
         run: |
-          python3 -m compileall -q fleet_control tests scripts/fleet_health_probe.py scripts/codex_inventory.py scripts/openclaw-inventory-adapter.py
+          python3 -m compileall -q fleet_control tests scripts/fleet_health_probe.py scripts/codex_inventory.py scripts/openclaw_transport.py scripts/openclaw-inventory-adapter.py
           sh -n scripts/idol-dev
       - name: Run fail-closed controller tests
         run: python3 -m unittest discover -s tests -v

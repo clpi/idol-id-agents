@@ -1,0 +1,21 @@
+{
+  "id": "openclaw-fleet-snapshot",
+  "name": "IDOL Fleet Active Work Snapshot",
+  "description": "Authenticated read-only projection of canonical gateway active-work counters.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "openclawPackageRoot"
+    ],
+    "properties": {
+      "openclawPackageRoot": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
