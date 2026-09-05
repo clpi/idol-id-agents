@@ -31,11 +31,13 @@ class SystemdInstallerTests(unittest.TestCase):
         service_path_value: Optional[str] = None,
         config_update: Optional[dict[str, object]] = None,
         preserve_holds: bool = False,
+        precreate_state: bool = True,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path, Path]:
         binaries = root / "bin"
         binaries.mkdir()
         state = root / "state"
-        state.mkdir(mode=0o700)
+        if precreate_state:
+            state.mkdir(mode=0o700)
         repository = root / "repository"
         (repository / ".git").mkdir(parents=True)
         service_home = root / "service-home"
@@ -316,6 +318,7 @@ class SystemdInstallerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("requires FLEET_SERVICE_PATH", result.stderr)
             self.assertFalse(unit_dir.exists())
+
             self.assertEqual(systemctl_log.read_text(encoding="utf-8").splitlines(), ["--version"])
 
         with tempfile.TemporaryDirectory() as directory:
@@ -333,6 +336,37 @@ class SystemdInstallerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn("service PATH contains unsupported unit characters", result.stderr)
             self.assertFalse(unit_dir.exists())
+
+    def test_shared_inventory_path_and_default_disabled_control_are_provisioned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            result, unit_dir, _, _ = self.run_apply_installer(
+                root, config_update={"inventory": {"enabled": True, "auth_env": []}},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            shared = root / "service-home/.local/state/idol-fleet-inventory"
+            self.assertEqual(shared.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((shared / "snapshot.lock").stat().st_mode & 0o777, 0o600)
+            unit = (unit_dir / "idol-fleet-idol.service").read_text()
+            self.assertIn(f"ReadWritePaths={root / 'state'} {root / 'repository'} {shared}\n", unit)
+            state = root / "state/control/control-state.json"
+            self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+            from fleet_control.control import LocalControl
+            status = LocalControl(state.parent).status()
+            self.assertEqual(status.mode, "disabled")
+            self.assertFalse(status.permitted)
+
+    def test_first_install_creates_private_disabled_control(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            result, _, _, _ = self.run_apply_installer(root, precreate_state=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "state").stat().st_mode & 0o777, 0o700)
+            from fleet_control.control import LocalControl
+            status = LocalControl(root / "state/control").status()
+            self.assertTrue(status.integrity_valid)
+            self.assertEqual(status.mode, "disabled")
+            self.assertFalse(status.permitted)
 
     def test_system_mode_refuses_uninstalled_credential_environment(self) -> None:
         configurations = (

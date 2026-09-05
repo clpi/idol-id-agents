@@ -8,6 +8,7 @@ import sys
 
 from .calibration import calibrate
 from .controller import load_config
+from .control import LocalControl
 from .manager import ManagedFleetController
 from .performance import load_receipt, record_outcome
 
@@ -29,6 +30,16 @@ def parser() -> argparse.ArgumentParser:
 
     commands.add_parser("status", help="verify and print private controller state")
 
+    control = commands.add_parser("control", help="inspect or change the additional local dispatch gate")
+    operations = control.add_subparsers(dest="operation", required=True)
+    operations.add_parser("status", help="read control state without creating or repairing it")
+    enable = operations.add_parser("enable", help="enable the local gate for a bounded lease")
+    enable.add_argument("--ttl-seconds", required=True, type=int)
+    refresh = operations.add_parser("refresh", help="explicitly renew an existing enable lease")
+    refresh.add_argument("--ttl-seconds", required=True, type=int)
+    operations.add_parser("disable", help="revoke permits and prevent new dispatch boundaries")
+    operations.add_parser("drain", help="stop new attempts while preserving already-owned attempts")
+
     calibration = commands.add_parser("calibrate", help="run no-inference route and containment proofs")
     calibration.add_argument("--ttl-seconds", type=int, default=None)
 
@@ -41,6 +52,13 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        if args.command == "control":
+            _, config = load_config(args.config)
+            control = LocalControl(config.state_dir / "control")
+            operation = getattr(control, args.operation)
+            result = operation(ttl_seconds=args.ttl_seconds) if args.operation in {"enable", "refresh"} else operation()
+            print(_json(asdict(result)))
+            return 0
         if args.command == "calibrate":
             raw, config = load_config(args.config)
             record = calibrate(

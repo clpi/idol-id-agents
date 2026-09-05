@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import signal
 import subprocess
 import tempfile
 import time
@@ -12,6 +11,8 @@ from typing import Any, Mapping
 
 from .model import BillingClass, Route, WorkOrder
 from .policy import assert_order_route
+from .control import AttemptPermit, LocalControl
+from .processes import kill_group_and_reap
 
 
 class RuntimeRefusal(RuntimeError):
@@ -40,9 +41,10 @@ class CommandRuntime:
 
     _BASE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "USER", "LOGNAME")
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(self, state_dir: Path, *, control: LocalControl | None = None) -> None:
         self.state_dir = Path(state_dir).expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.control = control if control is not None else LocalControl(self.state_dir / "control")
 
     @staticmethod
     def _format_argument(argument: str, values: Mapping[str, str]) -> str:
@@ -65,25 +67,6 @@ class CommandRuntime:
                 raise RuntimeRefusal(f"required route auth environment is absent: {name}")
             env[name] = value
         return env
-
-    @staticmethod
-    def _terminate(process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        try:
-            process.wait(timeout=8)
-            return
-        except subprocess.TimeoutExpired:
-            pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        process.wait(timeout=8)
 
     @staticmethod
     def _bounded_text(value: str, limit: int = 2_000_000) -> tuple[str, bool]:
@@ -243,7 +226,8 @@ class CommandRuntime:
             session_id=str(payload.get("session_id")) if payload.get("session_id") else None,
         )
 
-    def execute(self, *, route: Route, order: WorkOrder, prompt_path: Path, cwd: Path) -> RunResult:
+    def execute(self, *, route: Route, order: WorkOrder, prompt_path: Path, cwd: Path,
+                attempt_permit: AttemptPermit | None = None) -> RunResult:
         assert_order_route(order, route)
         prompt_text = prompt_path.read_text(encoding="utf-8")
         with tempfile.NamedTemporaryFile(
@@ -268,23 +252,34 @@ class CommandRuntime:
         }
         command = [self._format_argument(argument, values) for argument in route.command]
         started_at = time.time()
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=self._environment(route, order),
-            text=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
+        process = None
+        try:
+            with self.control.transition_permit("process", attempt_permit):
+                process = subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=self._environment(route, order),
+                    text=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+        except BaseException:
+            if process is not None:
+                kill_group_and_reap(process)
+            usage_path.unlink(missing_ok=True)
+            raise
         try:
             stdout, stderr = process.communicate(timeout=route.timeout_seconds)
         except subprocess.TimeoutExpired as exc:
-            self._terminate(process)
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
+            kill_group_and_reap(process)
+            usage_path.unlink(missing_ok=True)
             raise RuntimeRefusal(f"route {route.id} exceeded {route.timeout_seconds}s") from exc
+        except BaseException:
+            kill_group_and_reap(process)
+            usage_path.unlink(missing_ok=True)
+            raise
         finally:
             ended_at = time.time()
         try:

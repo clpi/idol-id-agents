@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass
 import fcntl
 import hashlib
@@ -9,8 +9,9 @@ import os
 from pathlib import Path
 import subprocess
 import time
-from typing import Iterable, Sequence
+from typing import Callable, ContextManager, Iterable, Sequence
 
+from .processes import kill_group_and_reap
 from .scheduler import semantic_overlap
 
 
@@ -20,6 +21,9 @@ class ClaimConflict(RuntimeError):
 
 class ClaimCommandError(RuntimeError):
     pass
+
+
+_CLAIM_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +213,7 @@ class RepositoryClaimTransaction(AbstractContextManager["RepositoryClaimTransact
         paths: Sequence[str],
         ttl_seconds: int,
         required: bool = True,
+        acquire_guard: Callable[[], ContextManager[object]] | None = None,
     ) -> None:
         self.repository = Path(repository)
         self.owner = owner
@@ -216,23 +221,52 @@ class RepositoryClaimTransaction(AbstractContextManager["RepositoryClaimTransact
         self.paths = tuple(paths)
         self.ttl_seconds = ttl_seconds
         self.required = required
+        self.acquire_guard = acquire_guard if acquire_guard is not None else nullcontext
         self.command = self.repository / "tools/node/dev/claim"
         self.acquired: list[str] = []
 
-    def _run(self, arguments: Iterable[str], *, allow_failure: bool = False) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        arguments: Iterable[str],
+        *,
+        allow_failure: bool = False,
+        guard_acquire: bool = False,
+        mark_launched: Callable[[], None] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         if not self.command.is_file():
             if not self.required:
                 return subprocess.CompletedProcess([], 0, "")
             raise ClaimCommandError(f"repository claim command is absent: {self.command}")
-        result = subprocess.run(
-            [str(self.command), *arguments],
-            cwd=self.repository,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=30,
-            check=False,
-        )
+        command = [str(self.command), *arguments]
+        launch_guard = self.acquire_guard() if guard_acquire else nullcontext()
+        process = None
+        try:
+            with launch_guard:
+                process = subprocess.Popen(
+                    command,
+                    cwd=self.repository,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                if mark_launched is not None:
+                    mark_launched()
+        except BaseException:
+            if process is not None:
+                try:
+                    kill_group_and_reap(process)
+                except BaseException:
+                    pass
+            raise
+        try:
+            stdout, _ = process.communicate(timeout=_CLAIM_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = kill_group_and_reap(process)
+            exc.stdout = stdout
+            exc.stderr = stderr
+            raise
+        result = subprocess.CompletedProcess(command, process.returncode, stdout)
         if result.returncode != 0 and not allow_failure:
             raise ClaimConflict(result.stdout.strip() or "repository claim command refused")
         return result
@@ -242,8 +276,11 @@ class RepositoryClaimTransaction(AbstractContextManager["RepositoryClaimTransact
             return self
         try:
             for path in self.paths:
-                self._run(("acquire", self.owner, path, self.task_id))
-                self.acquired.append(path)
+                self._run(
+                    ("acquire", self.owner, path, self.task_id),
+                    guard_acquire=True,
+                    mark_launched=lambda path=path: self.acquired.append(path),
+                )
         except Exception:
             self.release()
             raise
@@ -253,7 +290,10 @@ class RepositoryClaimTransaction(AbstractContextManager["RepositoryClaimTransact
         for path in self.acquired:
             # Current IDOL claims renew by a reentrant acquire from the same
             # owner; the repository authority updates its timestamp.
-            self._run(("acquire", self.owner, path, self.task_id))
+            self._run(
+                ("acquire", self.owner, path, self.task_id),
+                guard_acquire=True,
+            )
 
     def release(self) -> None:
         for path in reversed(self.acquired):

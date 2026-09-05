@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from fleet_control.calibration import calibrate
+from fleet_control.control import LocalControl
 from fleet_control.controller import load_config
 from fleet_control.gitops import current_sha
 from fleet_control.manager import ManagedFleetController
@@ -167,6 +168,7 @@ class ManagerTests(unittest.TestCase):
         if mode == "apply":
             raw, parsed = load_config(config_path)
             calibrate(raw_config=raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
+            LocalControl(state / "control").enable(ttl_seconds=600)
         return temporary, config_path, head, cancel_log
 
     def test_unmanaged_live_session_blocks_duplicate_but_is_not_cancelled(self) -> None:
