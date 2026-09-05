@@ -61,6 +61,15 @@ class ModelTests(unittest.TestCase):
         other = replace(route, proof=self.proof(trusted=True))
         self.assertEqual(route.subject_hash, other.subject_hash)
 
+    def test_route_subject_tracks_bound_file_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            subject = pathlib.Path(temporary) / "auth.json"
+            subject.write_text('{"account":"included"}')
+            route = replace(self.route(), proof_subject_files=(subject,))
+            initial = route.subject_hash
+            subject.write_text('{"account":"changed!"}')
+            self.assertNotEqual(route.subject_hash, initial)
+
     def test_work_order_requires_exact_sha(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             order = self.order(pathlib.Path(temporary))

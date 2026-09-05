@@ -11,7 +11,14 @@ import subprocess
 import time
 from typing import Any, Mapping, Sequence
 
-from .calibration import CalibrationError, apply_calibration, calibrate, config_hash, load_calibration
+from .calibration import (
+    CalibrationError,
+    apply_calibration,
+    calibrate,
+    config_hash,
+    load_calibration,
+    require_current_route_proof,
+)
 from .claims import ControllerLease, RepositoryClaimTransaction, SemanticClaimStore
 from .gitops import (
     GitRefusal,
@@ -30,7 +37,7 @@ from .gitops import (
     require_claimed_paths,
     require_exact_subject,
 )
-from .health import apply_circuits, record_failure, record_success
+from .health import apply_circuits, circuit_state, record_failure, record_success
 from .journal import Journal
 from .model import Assignment, Route, WorkOrder, load_routes, mapping, sequence, stable_hash
 from .policy import assert_order_route
@@ -189,38 +196,164 @@ class FleetController:
         self.runtime = CommandRuntime(self.config.state_dir / "runtime")
         self.lease_path = self.config.state_dir / "controller.lock"
 
+    @staticmethod
+    def _calibration_circuit_route(route: Route) -> Route:
+        return replace(route, id=f"{route.id}:calibration", enabled=True)
+
+    @staticmethod
+    def _disable_routes(routes: Sequence[Route]) -> tuple[Route, ...]:
+        return tuple(replace(route, enabled=False) if route.enabled else route for route in routes)
+
+    def _calibration_due_routes(
+        self,
+        configured: Sequence[Route],
+        calibrated: Sequence[Route],
+        *,
+        now: float,
+    ) -> tuple[Route, ...]:
+        current = {route.id: route for route in calibrated}
+        unavailable = tuple(
+            route for route in configured
+            if route.enabled and (current.get(route.id) is None or not current[route.id].enabled)
+        )
+        return tuple(
+            route for route in unavailable
+            if not circuit_state(self.journal, self._calibration_circuit_route(route)).open(now)
+        )
+
+    def _record_calibration_refusal(
+        self,
+        routes: Sequence[Route],
+        refusals: Mapping[str, str],
+        *,
+        now: float,
+    ) -> None:
+        by_id = {route.id: route for route in routes}
+        retry_after: dict[str, float] = {}
+        for route_id, error in sorted(refusals.items()):
+            route = by_id.get(route_id)
+            if route is None:
+                continue
+            row = record_failure(
+                self.journal,
+                self._calibration_circuit_route(route),
+                error_type="CalibrationError",
+                error=error,
+                at=now,
+            )
+            retry_after[route_id] = float(row["fact"]["retry_after"])
+        self.journal.append(
+            "fleet.calibration.refused",
+            {
+                "config_hash": config_hash(self.raw_config),
+                "route_refusals": dict(sorted(refusals.items())),
+                "retry_after": retry_after,
+            },
+            at=now,
+        )
+
+    def _calibration_route_was_refused(self, route_id: str) -> bool:
+        refused = False
+        for row in self.journal.events(
+            {"fleet.calibration.refused", "fleet.calibration.refreshed", "fleet.calibration.recovered"}
+        ):
+            fact = row.get("fact")
+            if not isinstance(fact, Mapping):
+                continue
+            if route_id in mapping(fact.get("route_refusals", {}), "route_refusals"):
+                refused = True
+            if route_id in sequence(fact.get("recovered_routes", ()), "recovered_routes"):
+                refused = False
+        return refused
+
+    def _record_calibration_result(
+        self,
+        routes: Sequence[Route],
+        record,
+        *,
+        now: float,
+    ) -> None:
+        recovered: list[str] = []
+        for route in routes:
+            if not route.enabled:
+                continue
+            calibration_route = self._calibration_circuit_route(route)
+            if route.id in record.route_refusals:
+                record_failure(
+                    self.journal,
+                    calibration_route,
+                    error_type="CalibrationError",
+                    error=record.route_refusals[route.id],
+                    at=now,
+                )
+            else:
+                circuit = circuit_state(self.journal, calibration_route)
+                was_refused = self._calibration_route_was_refused(route.id)
+                if circuit.consecutive_failures:
+                    record_success(self.journal, calibration_route, at=now)
+                if not circuit.consecutive_failures and not was_refused:
+                    continue
+                recovered.append(route.id)
+        self.journal.append(
+            "fleet.calibration.recovered" if recovered else "fleet.calibration.refreshed",
+            {
+                "expires_at": record.expires_at,
+                "config_hash": record.config_hash,
+                "route_refusals": dict(record.route_refusals),
+                "recovered_routes": recovered,
+            },
+            at=now,
+        )
+
     def _routes(self, *, now: float | None = None) -> tuple[Route, ...]:
-        routes = self.config.routes
+        current = time.time() if now is None else now
+        configured = self.config.routes
+        routes = configured
+        record = None
         if self.config.mode == "apply":
             try:
                 record = load_calibration(self.config.calibration_file)
-                if not record.valid(config_hash=config_hash(self.raw_config), now=now):
+                if not record.valid(config_hash=config_hash(self.raw_config), now=current):
                     raise CalibrationError("calibration is stale or does not match this controller/configuration")
-            except CalibrationError:
-                if not self.config.auto_calibrate:
-                    raise
-                record = calibrate(
+                routes = apply_calibration(
+                    routes=configured,
+                    record=record,
                     raw_config=self.raw_config,
-                    routes=routes,
-                    output=self.config.calibration_file,
-                    ttl_seconds=self.config.calibration_ttl_seconds,
-                    now=now,
+                    now=current,
                 )
-                self.journal.append(
-                    "fleet.calibration.refreshed",
-                    {
-                        "expires_at": record.expires_at,
-                        "config_hash": record.config_hash,
-                        "route_refusals": dict(record.route_refusals),
-                    },
-                    at=now,
-                )
-            routes = apply_calibration(
-                routes=routes,
-                record=record,
-                raw_config=self.raw_config,
-                now=now,
-            )
+            except CalibrationError:
+                routes = self._disable_routes(configured)
+                record = None
+            due_routes = self._calibration_due_routes(configured, routes, now=current)
+            if self.config.auto_calibrate and due_routes:
+                preserved_proofs = {
+                    route.id: asdict(route.proof)
+                    for route in routes
+                    if route.enabled and route.proof.valid(current)
+                }
+                try:
+                    refreshed = calibrate(
+                        raw_config=self.raw_config,
+                        routes=due_routes,
+                        output=self.config.calibration_file,
+                        ttl_seconds=self.config.calibration_ttl_seconds,
+                        now=current,
+                        preserved_proofs=preserved_proofs,
+                        preserved_refusals=record.route_refusals if record is not None else None,
+                    )
+                except CalibrationError as exc:
+                    refusals = exc.route_refusals or {
+                        route.id: str(exc) for route in due_routes
+                    }
+                    self._record_calibration_refusal(due_routes, refusals, now=current)
+                else:
+                    self._record_calibration_result(due_routes, refreshed, now=current)
+                    routes = apply_calibration(
+                        routes=configured,
+                        record=refreshed,
+                        raw_config=self.raw_config,
+                        now=current,
+                    )
         routes, facts = refresh_routes(routes, now=now)
         for fact in facts:
             self.journal.append("fleet.usage.observed" if fact["ok"] else "fleet.usage.refused", fact, at=now)
@@ -695,6 +828,23 @@ class FleetController:
     def dispatch(self, assignment: Assignment) -> Mapping[str, Any]:
         order = assignment.order
         route = assignment.route
+        try:
+            require_current_route_proof(route)
+        except CalibrationError as exc:
+            refused = {
+                "order_id": order.id,
+                "task_id": order.task_id,
+                "route_id": route.id,
+                "base_sha": order.base_sha,
+                "branch": order.branch,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "retryable_route_failure": True,
+                "worktree_preserved": False,
+            }
+            self._record_calibration_refusal((route,), {route.id: str(exc)}, now=time.time())
+            self.journal.append("attempt.refused", refused)
+            return refused
         assert_order_route(order, route)
         require_exact_subject(self.config.repository, order.base_sha)
         if is_dirty(self.config.repository):
@@ -953,6 +1103,23 @@ class FleetController:
         now = time.time()
         factors = route_factors(self.journal)
         circuits = {route.id: circuit_state(self.journal, route) for route in self.config.routes}
+        calibrated_by_id: dict[str, Route] = {}
+        if self.config.mode == "apply":
+            try:
+                record = load_calibration(self.config.calibration_file)
+                calibrated = apply_calibration(
+                    routes=self.config.routes,
+                    record=record,
+                    raw_config=self.raw_config,
+                    now=now,
+                )
+                calibrated_by_id = {route.id: route for route in calibrated}
+            except (CalibrationError, TypeError, ValueError):
+                pass
+        calibration_circuits = {
+            route.id: circuit_state(self.journal, self._calibration_circuit_route(route))
+            for route in self.config.routes
+        }
         return {
             "mode": self.config.mode,
             "repository": str(self.config.repository),
@@ -967,7 +1134,17 @@ class FleetController:
                     "model": route.model,
                     "billing": route.billing.value,
                     "configured_enabled": route.enabled,
-                    "subject_hash": route.subject_hash,
+                    "subject_hash": circuits[route.id].route_subject,
+                    "proof_subject_file_count": len(route.proof_subject_files),
+                    "calibration_current": bool(
+                        calibrated_by_id.get(route.id) is not None
+                        and calibrated_by_id[route.id].enabled
+                    ),
+                    "calibration_retry_after": (
+                        calibration_circuits[route.id].opened_until
+                        if calibration_circuits[route.id].open(now)
+                        else None
+                    ),
                     "performance_factor": factors.get(route.id, 1.0),
                     "circuit": asdict(circuits[route.id]),
                     "circuit_open": circuits[route.id].open(now),

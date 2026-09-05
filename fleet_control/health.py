@@ -25,11 +25,12 @@ class CircuitState:
 def circuit_state(journal: Journal, route: Route) -> CircuitState:
     failures = 0
     opened_until = 0.0
+    route_subject = route.subject_hash
     for row in journal.events({"route.failed", "route.succeeded"}):
         fact = row.get("fact")
         if not isinstance(fact, Mapping):
             continue
-        if fact.get("route_id") != route.id or fact.get("route_subject") != route.subject_hash:
+        if fact.get("route_id") != route.id or fact.get("route_subject") != route_subject:
             continue
         if row.get("kind") == "route.succeeded":
             failures = 0
@@ -38,7 +39,7 @@ def circuit_state(journal: Journal, route: Route) -> CircuitState:
         failures += 1
         delay = _BACKOFF_SECONDS[min(failures - 1, len(_BACKOFF_SECONDS) - 1)]
         opened_until = max(opened_until, float(row.get("at", 0)) + delay)
-    return CircuitState(route.id, route.subject_hash, failures, opened_until)
+    return CircuitState(route.id, route_subject, failures, opened_until)
 
 
 def apply_circuits(
@@ -75,7 +76,7 @@ def record_failure(
         "route.failed",
         {
             "route_id": route.id,
-            "route_subject": route.subject_hash,
+            "route_subject": previous.route_subject,
             "error_type": error_type,
             "error": error,
             "consecutive_failures": failures,

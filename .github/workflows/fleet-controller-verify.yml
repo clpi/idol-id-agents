@@ -7,6 +7,10 @@ on:
       - fleet_control/**
       - tests/**
       - scripts/idol-fleet
+      - scripts/idol-dev
+      - scripts/fleet_health_probe.py
+      - config/systemd/idol-health-probe.*
+      - config/idol-health-probe.env.example
       - scripts/hermes-route-proof.py
       - scripts/hermes-usage-adapter.py
       - scripts/zai-usage-adapter.py
@@ -22,6 +26,10 @@ on:
       - fleet_control/**
       - tests/**
       - scripts/idol-fleet
+      - scripts/idol-dev
+      - scripts/fleet_health_probe.py
+      - config/systemd/idol-health-probe.*
+      - config/idol-health-probe.env.example
       - scripts/hermes-route-proof.py
       - scripts/hermes-usage-adapter.py
       - scripts/zai-usage-adapter.py
@@ -58,7 +66,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile controller
-        run: python3 -m compileall -q fleet_control tests
+        run: |
+          python3 -m compileall -q fleet_control tests scripts/fleet_health_probe.py
+          sh -n scripts/idol-dev
       - name: Run fail-closed controller tests
         run: python3 -m unittest discover -s tests -v
       - name: Prove example routes are disabled and non-pay-go

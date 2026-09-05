@@ -57,7 +57,11 @@
       "enabled": false,
       "allowance": [],
       "proof_command": ["ollama", "list"],
-      "proof_expect": "(?m)^qwen3-coder:30b\\s"
+      "proof_expect": "(?m)^qwen3-coder:30b\\s",
+      "proof_subject_files": [
+        "/absolute/path/to/ollama-proof-adapter",
+        "/absolute/path/to/ollama-model-manifest"
+      ]
     },
     {
       "id": "codex-subscription",
@@ -97,7 +101,11 @@
       "enabled": false,
       "allowance": [],
       "proof_command": ["codex", "login", "status"],
-      "proof_expect": "(?i)(chatgpt|subscription|logged in)"
+      "proof_expect": "(?i)(chatgpt|subscription|logged in)",
+      "proof_subject_files": [
+        "/absolute/path/to/codex-proof-adapter",
+        "~/.codex/auth.json"
+      ]
     },
     {
       "id": "hermes-subscription",
@@ -132,7 +140,12 @@
       "enabled": false,
       "allowance": [],
       "proof_command": ["hermes", "auth", "status"],
-      "proof_expect": "(?i)(anthropic|claude).*(oauth|subscription|logged in)"
+      "proof_expect": "(?i)(anthropic|claude).*(oauth|subscription|logged in)",
+      "proof_subject_files": [
+        "/absolute/path/to/hermes-route-proof.py",
+        "~/.hermes/config.yaml",
+        "~/.hermes/auth.json"
+      ]
     }
   ]
 }

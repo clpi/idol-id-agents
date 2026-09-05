@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 import json
+import os
 import pathlib
 import re
+import stat
 import time
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -24,6 +26,53 @@ class BillingClass(str, Enum):
     UNKNOWN = "unknown"
 
 
+class ProofSubjectError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class ProofSubjectFile:
+    path: str
+    file_type: str
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not pathlib.Path(self.path).is_absolute():
+            raise ValueError("proof subject metadata path must be absolute")
+        if self.file_type != "regular":
+            raise ValueError("proof subject metadata must describe a regular file")
+        if any(value < 0 for value in (self.device, self.inode, self.mode, self.uid, self.gid, self.size)):
+            raise ValueError("proof subject metadata contains a negative identity field")
+        if self.mtime_ns <= 0 or self.ctime_ns <= 0:
+            raise ValueError("proof subject metadata timestamps must be positive")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.sha256):
+            raise ValueError("proof subject metadata hash must be lowercase SHA-256")
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "ProofSubjectFile":
+        return cls(
+            path=str(raw.get("path", "")).strip(),
+            file_type=str(raw.get("file_type", "")).strip(),
+            device=int(raw.get("device", -1)),
+            inode=int(raw.get("inode", -1)),
+            mode=int(raw.get("mode", -1)),
+            uid=int(raw.get("uid", -1)),
+            gid=int(raw.get("gid", -1)),
+            size=int(raw.get("size", -1)),
+            mtime_ns=int(raw.get("mtime_ns", 0)),
+            ctime_ns=int(raw.get("ctime_ns", 0)),
+            sha256=str(raw.get("sha256", "")).strip(),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class BillingProof:
     kind: str
@@ -32,6 +81,7 @@ class BillingProof:
     expires_at: float
     evidence_hash: str
     trusted: bool
+    subject_files: tuple[ProofSubjectFile, ...] = ()
 
     def valid(self, now: float | None = None) -> bool:
         current = time.time() if now is None else now
@@ -52,6 +102,10 @@ class BillingProof:
             expires_at=float(raw.get("expires_at", 0)),
             evidence_hash=str(raw.get("evidence_hash", "")).strip(),
             trusted=raw.get("trusted") is True,
+            subject_files=tuple(
+                ProofSubjectFile.from_mapping(mapping(item, "proof subject file"))
+                for item in sequence(raw.get("subject_files", ()), "subject_files")
+            ),
         )
 
 
@@ -96,6 +150,7 @@ class Route:
     allowance: tuple[AllowanceWindow, ...] = ()
     proof_command: tuple[str, ...] = ()
     proof_expect: str = ""
+    proof_subject_files: tuple[pathlib.Path, ...] = ()
     usage_command: tuple[str, ...] = ()
     usage_auth_env: tuple[str, ...] = ()
     usage_timeout_seconds: int = 30
@@ -128,9 +183,70 @@ class Route:
         for name in (*self.auth_env, *self.usage_auth_env):
             if not _SAFE_ENV_RE.fullmatch(name):
                 raise ValueError(f"invalid auth environment name: {name!r}")
+        if any(not path.is_absolute() for path in self.proof_subject_files):
+            raise ValueError("proof_subject_files must contain absolute paths")
+        if len(self.proof_subject_files) != len(set(self.proof_subject_files)):
+            raise ValueError("proof_subject_files contains a duplicate path")
 
-    @property
-    def subject_hash(self) -> str:
+    @staticmethod
+    def _capture_proof_subject(configured: pathlib.Path) -> ProofSubjectFile:
+        try:
+            parent = configured.parent.resolve(strict=True)
+            path = parent / configured.name
+            entry = path.lstat()
+            if stat.S_ISLNK(entry.st_mode):
+                raise ProofSubjectError(f"proof subject must not be a symlink: {configured}")
+            if not stat.S_ISREG(entry.st_mode):
+                raise ProofSubjectError(f"proof subject is not a regular file: {configured}")
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            with os.fdopen(descriptor, "rb") as handle:
+                before = os.fstat(handle.fileno())
+                if not stat.S_ISREG(before.st_mode):
+                    raise ProofSubjectError(f"proof subject is not a regular file: {configured}")
+                digest = hashlib.sha256()
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(block)
+                after = os.fstat(handle.fileno())
+        except ProofSubjectError:
+            raise
+        except (OSError, RuntimeError) as exc:
+            raise ProofSubjectError(f"proof subject is unreadable: {configured}") from exc
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if identity_before != identity_after:
+            raise ProofSubjectError(f"proof subject changed while reading: {configured}")
+        return ProofSubjectFile(
+            path=str(path),
+            file_type="regular",
+            device=after.st_dev,
+            inode=after.st_ino,
+            mode=stat.S_IMODE(after.st_mode),
+            uid=after.st_uid,
+            gid=after.st_gid,
+            size=after.st_size,
+            mtime_ns=after.st_mtime_ns,
+            ctime_ns=after.st_ctime_ns,
+            sha256=digest.hexdigest(),
+        )
+
+    def proof_subject_metadata(self) -> tuple[ProofSubjectFile, ...]:
+        return tuple(self._capture_proof_subject(path) for path in self.proof_subject_files)
+
+    def subject_hash_for(self, subject_files: tuple[ProofSubjectFile, ...]) -> str:
         payload = {
             "id": self.id,
             "provider": self.provider,
@@ -142,6 +258,24 @@ class Route:
             "billing": self.billing.value,
             "roles": sorted(self.roles),
             "auth_env": self.auth_env,
+            "proof_command": self.proof_command,
+            "proof_expect": self.proof_expect,
+            "proof_subject_files": [
+                {
+                    "path": item.path,
+                    "file_type": item.file_type,
+                    "device": item.device,
+                    "inode": item.inode,
+                    "mode": item.mode,
+                    "uid": item.uid,
+                    "gid": item.gid,
+                    "size": item.size,
+                    "mtime_ns": item.mtime_ns,
+                    "ctime_ns": item.ctime_ns,
+                    "sha256": item.sha256,
+                }
+                for item in subject_files
+            ],
             "usage_command": self.usage_command,
             "usage_auth_env": self.usage_auth_env,
             "usage_timeout_seconds": self.usage_timeout_seconds,
@@ -149,6 +283,19 @@ class Route:
             "usage_required": self.usage_required,
         }
         return stable_hash(payload)
+
+    @property
+    def subject_hash(self) -> str:
+        try:
+            return self.subject_hash_for(self.proof_subject_metadata())
+        except ProofSubjectError:
+            return stable_hash(
+                {
+                    "route": self.subject_hash_for(()),
+                    "proof_subject_files": tuple(str(path) for path in self.proof_subject_files),
+                    "proof_subject_error": True,
+                }
+            )
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "Route":
@@ -174,6 +321,10 @@ class Route:
             ),
             proof_command=string_tuple(raw.get("proof_command", ()), "proof_command"),
             proof_expect=str(raw.get("proof_expect", "")),
+            proof_subject_files=tuple(
+                pathlib.Path(path).expanduser()
+                for path in string_tuple(raw.get("proof_subject_files", ()), "proof_subject_files")
+            ),
             usage_command=string_tuple(raw.get("usage_command", ()), "usage_command"),
             usage_auth_env=string_tuple(raw.get("usage_auth_env", ()), "usage_auth_env"),
             usage_timeout_seconds=int(raw.get("usage_timeout_seconds", 30)),

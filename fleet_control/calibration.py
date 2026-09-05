@@ -14,12 +14,14 @@ import time
 from typing import Any, Mapping, Sequence
 
 from . import __version__
-from .model import BillingClass, BillingProof, Route, stable_hash
+from .model import BillingClass, BillingProof, ProofSubjectError, Route, stable_hash
 from .scheduler import path_overlap, semantic_overlap
 
 
 class CalibrationError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, route_refusals: Mapping[str, str] | None = None) -> None:
+        super().__init__(message)
+        self.route_refusals = dict(route_refusals or {})
 
 
 _REQUIRED_CONTROLS = frozenset({
@@ -80,6 +82,12 @@ def _probe_route(route: Route, *, ttl_seconds: int, now: float) -> BillingProof:
         raise CalibrationError(f"route {route.id} has forbidden billing class {route.billing.value}")
     if not route.proof_command or not route.proof_expect:
         raise CalibrationError(f"route {route.id} has no no-inference proof command")
+    if not route.proof_subject_files:
+        raise CalibrationError(f"route {route.id} has no bound proof subject files")
+    try:
+        subject_files = route.proof_subject_metadata()
+    except ProofSubjectError as exc:
+        raise CalibrationError(f"route {route.id} {exc}") from exc
     try:
         result = subprocess.run(
             list(route.proof_command),
@@ -93,6 +101,12 @@ def _probe_route(route: Route, *, ttl_seconds: int, now: float) -> BillingProof:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CalibrationError(f"route {route.id} proof command failed to execute") from exc
+    try:
+        final_subject_files = route.proof_subject_metadata()
+    except ProofSubjectError as exc:
+        raise CalibrationError(f"route {route.id} {exc}") from exc
+    if final_subject_files != subject_files:
+        raise CalibrationError(f"route {route.id} proof subject changed during calibration")
     output = result.stdout[:1_000_000]
     if result.returncode != 0:
         raise CalibrationError(f"route {route.id} proof command returned {result.returncode}")
@@ -111,7 +125,8 @@ def _probe_route(route: Route, *, ttl_seconds: int, now: float) -> BillingProof:
     }:
         raise CalibrationError(f"route {route.id} has unsupported proof kind {proof_kind!r}")
     evidence = {
-        "route_subject": route.subject_hash,
+        "route_subject": route.subject_hash_for(subject_files),
+        "subject_files": [asdict(item) for item in subject_files],
         "proof_command": route.proof_command,
         "proof_expression": route.proof_expect,
         "returncode": result.returncode,
@@ -120,11 +135,12 @@ def _probe_route(route: Route, *, ttl_seconds: int, now: float) -> BillingProof:
     }
     return BillingProof(
         kind=proof_kind,
-        subject_hash=route.subject_hash,
+        subject_hash=route.subject_hash_for(subject_files),
         observed_at=now,
         expires_at=now + ttl_seconds,
         evidence_hash=stable_hash(evidence),
         trusted=True,
+        subject_files=subject_files,
     )
 
 
@@ -179,6 +195,8 @@ def calibrate(
     output: Path,
     ttl_seconds: int = 3600,
     now: float | None = None,
+    preserved_proofs: Mapping[str, Mapping[str, Any]] | None = None,
+    preserved_refusals: Mapping[str, str] | None = None,
 ) -> CalibrationRecord:
     if ttl_seconds < 300 or ttl_seconds > 86400:
         raise CalibrationError("calibration TTL outside supported bounds")
@@ -186,19 +204,24 @@ def calibrate(
     controls = run_controls()
     if not _REQUIRED_CONTROLS.issubset(controls) or not all(controls.values()):
         raise CalibrationError("one or more controller controls failed")
-    proofs: dict[str, Mapping[str, Any]] = {}
-    refusals: dict[str, str] = {}
+    proofs: dict[str, Mapping[str, Any]] = dict(preserved_proofs or {})
+    refusals: dict[str, str] = dict(preserved_refusals or {})
     for route in routes:
         if not route.enabled:
             continue
+        refusals.pop(route.id, None)
         try:
             proof = _probe_route(route, ttl_seconds=ttl_seconds, now=current)
             proofs[route.id] = asdict(proof)
         except CalibrationError as exc:
+            proofs.pop(route.id, None)
             refusals[route.id] = str(exc)
     if not proofs:
         detail = "; ".join(f"{route_id}: {error}" for route_id, error in sorted(refusals.items()))
-        raise CalibrationError(f"calibration produced no enabled route proof: {detail}")
+        raise CalibrationError(
+            f"calibration produced no enabled route proof: {detail}",
+            route_refusals=refusals,
+        )
     record = CalibrationRecord(
         version="idol.fleet.calibration.v1",
         config_hash=config_hash(raw_config),
@@ -237,20 +260,41 @@ def load_calibration(path: Path) -> CalibrationRecord:
     controls = raw.get("controls")
     if not isinstance(routes, Mapping) or not isinstance(controls, Mapping):
         raise CalibrationError("calibration record has invalid route/control facts")
-    return CalibrationRecord(
-        version=str(raw.get("version", "")),
-        config_hash=str(raw.get("config_hash", "")),
-        controller_version=str(raw.get("controller_version", "")),
-        observed_at=float(raw.get("observed_at", 0)),
-        expires_at=float(raw.get("expires_at", 0)),
-        routes=routes,
-        route_refusals={str(key): str(value) for key, value in mapping_or_empty(raw.get("route_refusals")).items()},
-        controls={str(key): value is True for key, value in controls.items()},
-    )
+    try:
+        return CalibrationRecord(
+            version=str(raw.get("version", "")),
+            config_hash=str(raw.get("config_hash", "")),
+            controller_version=str(raw.get("controller_version", "")),
+            observed_at=float(raw.get("observed_at", 0)),
+            expires_at=float(raw.get("expires_at", 0)),
+            routes=routes,
+            route_refusals={
+                str(key): str(value)
+                for key, value in mapping_or_empty(raw.get("route_refusals")).items()
+            },
+            controls={str(key): value is True for key, value in controls.items()},
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CalibrationError("calibration record has malformed scalar facts") from exc
 
 
 def mapping_or_empty(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def require_current_route_proof(route: Route, *, now: float | None = None) -> None:
+    try:
+        subject_files = route.proof_subject_metadata()
+    except ProofSubjectError as exc:
+        raise CalibrationError(f"route {route.id} {exc}") from exc
+    if not subject_files:
+        raise CalibrationError(f"route {route.id} has no bound proof subject files")
+    if not route.proof.valid(now):
+        raise CalibrationError(f"route {route.id} billing proof is invalid or expired")
+    if route.proof.subject_files != subject_files:
+        raise CalibrationError(f"route {route.id} proof subject files changed")
+    if route.proof.subject_hash != route.subject_hash_for(subject_files):
+        raise CalibrationError(f"route {route.id} proof subject does not match the route")
 
 
 def apply_calibration(
@@ -268,6 +312,12 @@ def apply_calibration(
         if not isinstance(proof_raw, Mapping):
             calibrated.append(replace(route, enabled=False))
             continue
-        proof = BillingProof.from_mapping(proof_raw)
-        calibrated.append(replace(route, proof=proof))
+        try:
+            proof = BillingProof.from_mapping(proof_raw)
+            candidate = replace(route, proof=proof)
+            require_current_route_proof(candidate, now=now)
+        except (CalibrationError, TypeError, ValueError, OverflowError):
+            calibrated.append(replace(route, enabled=False))
+            continue
+        calibrated.append(candidate)
     return tuple(calibrated)
