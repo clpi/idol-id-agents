@@ -11,6 +11,8 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
+from codex_inventory import observe_codex, scan_processes
+
 
 FORBIDDEN = {
     "message",
@@ -113,14 +115,6 @@ def call(method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, A
     return raw
 
 
-def rows(raw: Mapping[str, Any], keys: Sequence[str]) -> Sequence[Any]:
-    for key in keys:
-        value = raw.get(key)
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            return value
-    return ()
-
-
 def pick(raw: Mapping[str, Any], *keys: str) -> Any:
     for key in keys:
         value = raw.get(key)
@@ -178,7 +172,7 @@ def session_row(value: Any) -> Mapping[str, Any] | None:
     meta = metadata(value)
     session_id = pick(value, "id", "sessionId", "session_id", "key")
     status = pick(value, "status", "state", "phase")
-    if status is None and value.get("hasActiveRun") is True:
+    if value.get("hasActiveRun") is True or value.get("hasActiveSubagentRun") is True:
         status = "running"
     if session_id is None or status is None:
         return None
@@ -197,23 +191,6 @@ def session_row(value: Any) -> Mapping[str, Any] | None:
         "base_sha": str(pick(meta, "idolBaseSha", "idol_base_sha")) if pick(meta, "idolBaseSha", "idol_base_sha") else None,
         "host": text(pick(value, "host", "node", "placement")),
         "actor": text(pick(value, "agentId", "agent_id", "actor")),
-    }
-    return {key: item for key, item in row.items() if item is not None}
-
-
-def agent_row(value: Any) -> Mapping[str, Any] | None:
-    if not isinstance(value, Mapping):
-        return None
-    agent_id = pick(value, "id", "agentId", "agent_id", "name")
-    if agent_id is None:
-        return None
-    row = {
-        "id": str(agent_id),
-        "status": str(pick(value, "status", "state") or "unknown").lower(),
-        "provider": text(pick(value, "provider", "providerId", "provider_id")),
-        "model": text(pick(value, "model", "modelId", "model_id")),
-        "host": text(pick(value, "host", "node", "placement")),
-        "role": text(pick(value, "role", "kind")),
     }
     return {key: item for key, item in row.items() if item is not None}
 
@@ -262,46 +239,96 @@ def process_actor(arguments: Sequence[str]) -> str | None:
 
 
 def process_sessions(observed_at: float) -> list[Mapping[str, Any]]:
-    rows: list[Mapping[str, Any]] = []
-    proc = Path("/proc")
-    if not proc.is_dir():
-        return rows
+    observation = observe_codex(scan_processes(), observed_at=observed_at)
+    result = list(observation.sessions)
     hostname = socket.gethostname()
-    for directory in proc.iterdir():
-        if not directory.name.isdigit():
+    for process in observation.processes:
+        if process.identity in observation.covered_processes:
             continue
-        try:
-            arguments = [
-                part.decode("utf-8", "replace")
-                for part in (directory / "cmdline").read_bytes().split(b"\0")
-                if part
-            ]
-        except OSError:
-            continue
+        arguments = process.arguments
         actor = process_actor(arguments)
         if actor is None:
             continue
-        environment = selected_environment(directory / "environ")
-        task_id = environment.get("IDOL_FLEET_TASK")
-        try:
-            stat = (directory / "stat").read_text(encoding="utf-8").split()
-            start = stat[21] if len(stat) > 21 else "unknown"
-        except OSError:
-            start = "unknown"
+        environment = selected_environment(process.directory / "environ")
         row = {
-            "id": f"process-{directory.name}-{start}",
+            "id": f"process-{process.pid}-{process.start_time}",
             "status": "running",
             "last_activity": observed_at,
             "provider": argument(arguments, "--provider"),
             "model": argument(arguments, "-m", "--model"),
             "order_id": environment.get("IDOL_FLEET_ORDER"),
-            "task_id": task_id,
+            "task_id": environment.get("IDOL_FLEET_TASK"),
             "base_sha": environment.get("IDOL_FLEET_BASE_SHA"),
             "host": hostname,
             "actor": actor,
         }
-        rows.append({key: value for key, value in row.items() if value not in (None, "")})
-    return rows
+        result.append({key: value for key, value in row.items() if value not in (None, "")})
+    return result
+
+
+def visible_gateway_sessions() -> list[Mapping[str, Any]]:
+    """Read every visible session page; this does not cover cron executions."""
+    result: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    offset = 0
+    deadline = time.monotonic() + 20
+    for _ in range(50):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("gateway session pagination exceeded its time bound")
+        page = call("sessions.list", {
+            "limit": 200, "offset": offset,
+            "includeGlobal": True, "includeUnknown": True,
+        })
+        items = page.get("sessions")
+        count, total, more = page.get("count"), page.get("totalCount"), page.get("hasMore")
+        if (
+            not isinstance(items, list)
+            or type(count) is not int or count != len(items)
+            or type(total) is not int or total < offset + count
+            or type(more) is not bool
+            or page.get("limitApplied") != 200
+            or type(page.get("limitApplied")) is not int
+            or (offset > 0 and "offset" not in page)
+            or ("offset" in page and (type(page["offset"]) is not int or page["offset"] != offset))
+            or "nextOffset" not in page
+            or len(items) > 200
+        ):
+            raise RuntimeError("gateway session pagination metadata is incomplete")
+        for item in items:
+            if not isinstance(item, Mapping):
+                raise RuntimeError("gateway session row is malformed")
+            key = item.get("key")
+            if not isinstance(key, str) or not key or key in seen:
+                raise RuntimeError("gateway session keys are missing or repeated")
+            if type(item.get("hasActiveRun")) is not bool or (
+                "hasActiveSubagentRun" in item and type(item["hasActiveSubagentRun"]) is not bool
+            ):
+                raise RuntimeError("gateway session activity metadata is incomplete")
+            seen.add(key)
+            row = session_row(item)
+            if row is not None:
+                result.append(row)
+        next_offset = page.get("nextOffset")
+        if not more:
+            if next_offset is not None or offset + count != total:
+                raise RuntimeError("gateway session pagination did not finish")
+            return result
+        if (
+            not items or type(next_offset) is not int
+            or next_offset != offset + count or next_offset >= total
+        ):
+            raise RuntimeError("gateway session pagination did not advance")
+        offset = next_offset
+    raise RuntimeError("gateway session pagination exceeded its page bound")
+
+
+def unidentified_work(sessions: Sequence[Mapping[str, Any]]) -> bool:
+    terminal = {"completed", "done", "failed", "cancelled", "rejected", "superseded", "stopped"}
+    return any(
+        row.get("status") not in terminal
+        and not row.get("order_id") and not row.get("task_id")
+        for row in sessions
+    )
 
 
 def emit_inventory(
@@ -330,7 +357,7 @@ def main() -> int:
     try:
         observed_at = time.time()
         processes = process_sessions(observed_at)
-        if any(not row.get("order_id") and not row.get("task_id") for row in processes):
+        if unidentified_work(processes):
             emit_inventory(
                 observed_at=observed_at,
                 source="local-process-fast-fence",
@@ -338,18 +365,17 @@ def main() -> int:
                 agents=(),
             )
             return 0
-        sessions_raw = call("sessions.list", {"limit": 10})
-        agents_raw = call("agents.list")
-        sessions = [row for item in rows(sessions_raw, ("sessions", "items")) if (row := session_row(item))]
-        sessions.extend(processes)
-        agents = [row for item in rows(agents_raw, ("agents", "items")) if (row := agent_row(item))]
-        emit_inventory(
-            observed_at=observed_at,
-            source="openclaw-local-gateway",
-            sessions=sessions,
-            agents=agents,
-        )
-        return 0
+        sessions = [*visible_gateway_sessions(), *processes]
+        if unidentified_work(sessions):
+            emit_inventory(
+                observed_at=observed_at,
+                source="openclaw-visible-work-fence",
+                sessions=sessions,
+                agents=(),
+            )
+            return 0
+        # The gateway omits cron runs, including removed jobs that are still settling.
+        raise RuntimeError("OpenClaw cron execution coverage is unavailable; idleness is unproven")
     except Exception as exc:
         print(f"openclaw inventory refused: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
