@@ -503,6 +503,14 @@ test("returns generic errors without private content", async (t) => {
 });
 
 test("manifest requires an explicit package root and declares no weaker scope", async () => {
+  const packageManifest = JSON.parse(
+    await readFile(new URL("./package.json", import.meta.url), "utf8"),
+  );
+  assert.equal(packageManifest.private, true);
+  assert.deepEqual(packageManifest.openclaw.extensions, ["./index.js"]);
+  for (const key of ["dependencies", "peerDependencies", "optionalDependencies"]) {
+    assert.equal(packageManifest[key], undefined);
+  }
   const manifest = JSON.parse(
     await readFile(new URL("./openclaw.plugin.json", import.meta.url), "utf8"),
   );

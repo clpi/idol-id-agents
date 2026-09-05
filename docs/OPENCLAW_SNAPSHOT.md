@@ -4,7 +4,7 @@ The fleet's saved-session inventory cannot prove that OpenClaw is idle: cron wor
 
 ## Compatibility boundary
 
-This is a temporary unsupported private-API bridge for exactly `2026.8.1-beta.3`. The producer pins these installed module bytes:
+This is a temporary unsupported private-API bridge for exactly `2026.8.1-beta.3`. Its private package declares no installable dependencies: OpenClaw's existing loader supplies the public SDK, and the extension validates the installed host directly. It does not fetch or install OpenClaw. The producer pins these installed module bytes:
 
 | Module under the OpenClaw package | SHA-256 |
 | --- | --- |

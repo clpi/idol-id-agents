@@ -4,9 +4,6 @@
   "private": true,
   "description": "Authenticated read-only OpenClaw active-work snapshot for the IDOL fleet.",
   "type": "module",
-  "peerDependencies": {
-    "openclaw": "2026.8.1-beta.3"
-  },
   "openclaw": {
     "extensions": [
       "./index.js"
