@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the IDOL r16 health observer every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=idol-health-probe.service
+
+[Install]
+WantedBy=timers.target

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest import mock
 from fleet_control.calibration import calibrate
 from fleet_control.controller import ControllerError, FleetController, load_config
 from fleet_control.gitops import GitRefusal, current_sha
+from fleet_control.health import record_failure
 from fleet_control.model import stable_hash
 
 
@@ -110,6 +112,7 @@ class ControllerTests(unittest.TestCase):
                     "allowance": [],
                     "proof_command": ["python3", str(proof)],
                     "proof_expect": "LOCAL TEST ROUTE READY",
+                    "proof_subject_files": [str(proof)],
                 }
             ],
         }
@@ -194,6 +197,156 @@ class ControllerTests(unittest.TestCase):
             self.assertFalse(sentinel.exists())
             self.assertFalse(result.attempts)
 
+    def test_all_route_calibration_outage_completes_without_dispatch(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+        os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+
+        def restore_claim_log() -> None:
+            if old is None:
+                os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+            else:
+                os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+        self.addCleanup(restore_claim_log)
+        with temporary:
+            config = json.loads(config_path.read_text())
+            config["auto_calibrate"] = True
+            config_path.write_text(json.dumps(config))
+            raw, parsed = load_config(config_path)
+            calibrate(raw_config=raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
+            proof = Path(config["routes"][0]["proof_subject_files"][0])
+            proof_runs = root / "proof-runs"
+            proof.write_text(
+                "from pathlib import Path\n"
+                f"path = Path({str(proof_runs)!r})\n"
+                "path.write_text(path.read_text() + 'run\\n' if path.exists() else 'run\\n')\n"
+                "raise SystemExit(2)\n"
+            )
+            sentinel = root / "agent-ran"
+            agent.write_text("from pathlib import Path; Path(%r).write_text('ran')\n" % str(sentinel))
+
+            controller = FleetController(config_path=config_path)
+            result = controller.run_once()
+
+            self.assertFalse(result.plan.assignments)
+            self.assertFalse(result.attempts)
+            self.assertFalse(sentinel.exists())
+            self.assertEqual(proof_runs.read_text().splitlines(), ["run"])
+            kinds = [row["kind"] for row in controller.journal.verify()]
+            self.assertIn("fleet.calibration.refused", kinds)
+            self.assertEqual(kinds[-1], "fleet.cycle.completed")
+
+            second = controller.run_once()
+            self.assertFalse(second.plan.assignments)
+            self.assertFalse(second.attempts)
+            self.assertEqual(proof_runs.read_text().splitlines(), ["run"])
+            self.assertEqual(
+                [row["kind"] for row in controller.journal.verify()].count("fleet.calibration.refused"),
+                1,
+            )
+            refusal = next(
+                row for row in controller.journal.verify() if row["kind"] == "fleet.calibration.refused"
+            )
+            retry_at = refusal["fact"]["retry_after"]["local-test"]
+            route_status = controller.status()["routes"][0]
+            self.assertFalse(route_status["calibration_current"])
+            self.assertEqual(route_status["calibration_retry_after"], retry_at)
+            self.assertEqual(route_status["proof_subject_file_count"], 1)
+            with mock.patch("fleet_control.controller.time.time", return_value=retry_at + 0.01):
+                third = controller.run_once()
+            self.assertFalse(third.plan.assignments)
+            self.assertFalse(third.attempts)
+            self.assertEqual(proof_runs.read_text().splitlines(), ["run", "run"])
+
+            (state / "work-orders/t_controller_1.json").unlink()
+            proof.write_text("print('LOCAL TEST ROUTE READY')\n")
+            with mock.patch("fleet_control.controller.time.time", return_value=retry_at + 1):
+                recovered = controller.run_once()
+            self.assertFalse(recovered.plan.assignments)
+            kinds = [row["kind"] for row in controller.journal.verify()]
+            self.assertIn("fleet.calibration.recovered", kinds)
+            self.assertNotIn("attempt.started", kinds)
+            self.assertNotIn("acquire", claim_log.read_text())
+
+    def test_failed_route_refresh_preserves_independently_proven_route(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+        os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+        try:
+            with temporary:
+                config = json.loads(config_path.read_text())
+                config["auto_calibrate"] = True
+                healthy_proof = Path(config["routes"][0]["proof_subject_files"][0])
+                healthy_state = root / "healthy-state"
+                healthy_state.write_text("ready")
+                healthy_proof.write_text(
+                    "from pathlib import Path\n"
+                    f"ready = Path({str(healthy_state)!r}).read_text() == 'ready'\n"
+                    "print('LOCAL TEST ROUTE READY' if ready else 'REFUSED')\n"
+                    "raise SystemExit(0 if ready else 2)\n"
+                )
+                failed_proof = root / "failed-proof.py"
+                failed_proof.write_text("raise SystemExit(2)\n")
+                failed_route = dict(config["routes"][0])
+                failed_route.update(
+                    {
+                        "id": "failed-test",
+                        "proof_command": ["python3", str(failed_proof)],
+                        "proof_subject_files": [str(failed_proof)],
+                    }
+                )
+                config["routes"].append(failed_route)
+                order_path = state / "work-orders/t_controller_1.json"
+                order = json.loads(order_path.read_text())
+                order["route_ids"].append("failed-test")
+                order_path.write_text(json.dumps(order))
+                config_path.write_text(json.dumps(config))
+                raw, parsed = load_config(config_path)
+                calibrate(
+                    raw_config=raw,
+                    routes=parsed.routes,
+                    output=parsed.calibration_file,
+                    ttl_seconds=600,
+                )
+                healthy_state.write_text("failed")
+
+                result = FleetController(config_path=config_path).run_once()
+
+                self.assertEqual([item.route.id for item in result.plan.assignments], ["local-test"])
+                self.assertEqual(len(result.attempts), 1)
+                self.assertIn("commit", result.attempts[0])
+        finally:
+            if old is None:
+                os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+            else:
+                os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_calibration_retry_selects_only_routes_whose_backoff_elapsed(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            controller = FleetController(config_path=config_path)
+            first = controller.config.routes[0]
+            second = replace(first, id="second-test")
+            for route in (first, second):
+                record_failure(
+                    controller.journal,
+                    controller._calibration_circuit_route(route),
+                    error_type="CalibrationError",
+                    error="refused",
+                    at=0,
+                )
+            record_failure(
+                controller.journal,
+                controller._calibration_circuit_route(second),
+                error_type="CalibrationError",
+                error="refused again",
+                at=300,
+            )
+            disabled = (replace(first, enabled=False), replace(second, enabled=False))
+            due = controller._calibration_due_routes((first, second), disabled, now=301)
+            self.assertEqual([route.id for route in due], [first.id])
+
     def test_apply_edits_only_claimed_path_and_commits(self) -> None:
         temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
         old = os.environ.get("IDOL_TEST_CLAIM_LOG")
@@ -210,6 +363,48 @@ class ControllerTests(unittest.TestCase):
                 self.assertIn("acquire", log)
                 self.assertIn("release", log)
                 self.assertNotIn("--owner", log)
+        finally:
+            if old is None:
+                os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+            else:
+                os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_dispatch_revalidates_live_proof_subject_before_claims_or_model(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+        os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+        try:
+            with temporary:
+                controller = FleetController(config_path=config_path)
+                observation, orders = controller.observe()
+                routes = controller._routes(now=observation.at)
+                plan = controller.plan(observation, orders, routes)
+                assignment = plan.assignments[0]
+                proof_subject = assignment.route.proof_subject_files[0]
+                proof_subject.unlink()
+                forged_proof = replace(
+                    assignment.route.proof,
+                    subject_hash=assignment.route.subject_hash,
+                )
+                forged = replace(
+                    assignment,
+                    route=replace(assignment.route, proof=forged_proof),
+                )
+                sentinel = root / "agent-ran"
+                agent.write_text(
+                    "from pathlib import Path; Path(%r).write_text('ran')\n" % str(sentinel)
+                )
+
+                refused = controller.dispatch(forged)
+
+                self.assertEqual(refused["error_type"], "CalibrationError")
+                self.assertTrue(refused["retryable_route_failure"])
+                self.assertFalse(sentinel.exists())
+                self.assertNotIn("acquire", claim_log.read_text())
+                self.assertNotIn(
+                    "attempt.started",
+                    [row["kind"] for row in controller.journal.verify()],
+                )
         finally:
             if old is None:
                 os.environ.pop("IDOL_TEST_CLAIM_LOG", None)

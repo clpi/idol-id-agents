@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+host=idol-dev
+case "${1-}" in
+  "") ;;
+  --cloudflare) host=idol-dev-cf; shift ;;
+  --help) printf '%s\n' 'idol-dev [--cloudflare]: resume the persistent r16 development terminal'; exit 0 ;;
+  *) printf '%s\n' 'usage: idol-dev [--cloudflare]' >&2; exit 2 ;;
+esac
+[ "$#" -eq 0 ] || { printf '%s\n' 'usage: idol-dev [--cloudflare]' >&2; exit 2; }
+exec ssh -t "$host" tmux new-session -A -s idol-development

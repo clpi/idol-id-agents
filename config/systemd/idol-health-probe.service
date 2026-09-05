@@ -1,0 +1,32 @@
+[Unit]
+Description=IDOL r16 read-only fleet health observer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=IDOL_HEALTH_STATE_DIR=%h/.local/state/idol-health-probe
+Environment=IDOL_HEALTH_HEARTBEAT=%h/.config/idol-hermes/primary-heartbeat
+Environment=IDOL_HEALTH_ROLE=%h/.config/idol-hermes/role
+Environment=IDOL_HEALTH_HEARTBEAT_MAX_AGE=55
+Environment=IDOL_HEALTH_IDOL_JOURNAL=%h/.local/state/idol-fleet-idol/fleet-history.jsonl
+Environment=IDOL_HEALTH_LIVE_JOURNAL=%h/.local/state/idol-fleet-live/fleet-history.jsonl
+EnvironmentFile=-%h/.config/idol-health-probe.env
+ExecStart=/usr/bin/python3 %h/.local/lib/idol-health-probe/health_probe.py
+TimeoutStartSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=%h/.local/state/idol-health-probe

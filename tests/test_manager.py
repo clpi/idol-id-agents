@@ -108,6 +108,7 @@ class ManagerTests(unittest.TestCase):
             "allowance":[],
             "proof_command":["python3",str(proof)],
             "proof_expect":"LOCAL ROUTE READY",
+            "proof_subject_files":[str(proof)],
             "usage_command":[],
             "usage_auth_env":[],
             "usage_timeout_seconds":30,
