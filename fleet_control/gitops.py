@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import json
 from pathlib import Path, PurePosixPath
@@ -58,21 +59,10 @@ def _run_guarded_process(
     stderr: int,
     launch_guard: LaunchGuard | None,
 ) -> subprocess.CompletedProcess[str]:
-    if launch_guard is None:
-        return subprocess.run(
-            command,
-            cwd=repository,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=stderr,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-
     process: subprocess.Popen[str] | None = None
     try:
-        with launch_guard():
+        guard = launch_guard() if launch_guard is not None else nullcontext()
+        with guard:
             process = subprocess.Popen(
                 command,
                 cwd=repository,
@@ -105,7 +95,7 @@ def _run_mutating_git(
     repository: Path,
     arguments: Sequence[str],
     *,
-    launch_guard: LaunchGuard | None,
+    launch_guard: LaunchGuard | None = None,
     timeout: int = 120,
 ) -> subprocess.CompletedProcess[str]:
     result = _run_guarded_process(
@@ -162,7 +152,7 @@ def fetch_remote_branch(repository: Path, *, remote: str, branch: str) -> str:
     ref = _branch_ref(branch)
     remote_name = _remote(remote)
     tracking_ref = f"refs/remotes/{remote_name}/{branch}"
-    run(
+    _run_mutating_git(
         repository,
         ("fetch", "--no-tags", "--quiet", remote_name, f"{ref}:{tracking_ref}"),
         timeout=120,
@@ -211,7 +201,7 @@ def fast_forward(repository: Path, *, branch: str, new_sha: str) -> None:
         raise GitRefusal("authority worktree is dirty")
     if not is_ancestor(repository, old_sha, new_sha):
         raise GitRefusal("remote branch is not a fast-forward of the authority worktree")
-    run(repository, ("merge", "--ff-only", new_sha), timeout=180)
+    _run_mutating_git(repository, ("merge", "--ff-only", new_sha), timeout=180)
     if current_sha(repository) != new_sha or is_dirty(repository):
         raise GitRefusal("authority worktree did not reach the clean fetched SHA")
 
@@ -234,9 +224,13 @@ def create_worktree(*, repository: Path, path: Path, branch: str, base_sha: str)
     if branch_check.returncode == 0:
         raise GitRefusal(f"worktree branch already exists: {branch}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    run(repository, ("worktree", "add", "--no-checkout", "-b", branch, str(path), base_sha), timeout=180)
-    run(path, ("checkout", "--detach", base_sha))
-    run(path, ("switch", "-C", branch, base_sha))
+    _run_mutating_git(
+        repository,
+        ("worktree", "add", "--no-checkout", "-b", branch, str(path), base_sha),
+        timeout=180,
+    )
+    _run_mutating_git(path, ("checkout", "--detach", base_sha))
+    _run_mutating_git(path, ("switch", "-C", branch, base_sha))
     if current_sha(path) != base_sha:
         raise GitRefusal("created worktree does not have the requested base SHA")
 
