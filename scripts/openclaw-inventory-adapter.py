@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 import json
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -12,6 +13,10 @@ import time
 from typing import Any, Mapping, Sequence
 
 from codex_inventory import observe_codex, scan_processes
+from openclaw_transport import observe_local_gateway
+
+
+GATEWAY_PORT = 18789
 
 
 FORBIDDEN = {
@@ -87,10 +92,11 @@ def openclaw_command() -> list[str]:
 
 def call(method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
     executable = openclaw_command()
-    command = [*executable, "gateway", "call", method]
+    command = [*executable, "gateway", "call", method, "--port", str(GATEWAY_PORT)]
     if params is not None:
         command.extend(("--params", json.dumps(params, sort_keys=True, separators=(",", ":"))))
     command.extend(("--json", "--timeout", "5000"))
+    before = observe_local_gateway(port=GATEWAY_PORT)
     try:
         result = subprocess.run(
             command,
@@ -105,6 +111,8 @@ def call(method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, A
         raise RuntimeError(f"read-only gateway call did not complete for {method}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"read-only gateway call returned {result.returncode} for {method}")
+    if observe_local_gateway(port=GATEWAY_PORT) != before:
+        raise RuntimeError("local OpenClaw gateway identity changed during observation")
     raw = json_object(result.stdout[:4_000_000])
     for key in ("payload", "result", "data"):
         candidate = raw.get(key)
@@ -113,86 +121,6 @@ def call(method: str, params: Mapping[str, Any] | None = None) -> Mapping[str, A
             break
     reject_content(raw)
     return raw
-
-
-def pick(raw: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = raw.get(key)
-        if value not in (None, ""):
-            return value
-    return None
-
-
-def text(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
-    return None
-
-
-def timestamp(value: Any) -> float | None:
-    if isinstance(value, (int, float)):
-        number = float(value)
-        return number / 1000.0 if number > 10_000_000_000 else number
-    if isinstance(value, str) and value.strip():
-        text = value.strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError:
-            return None
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.timestamp()
-    return None
-
-
-def metadata(raw: Mapping[str, Any]) -> Mapping[str, Any]:
-    value = raw.get("metadata")
-    if not isinstance(value, Mapping):
-        return {}
-    allowed = {
-        "idolAttemptId",
-        "idol_attempt_id",
-        "idolOrderId",
-        "idol_order_id",
-        "idolTaskId",
-        "idol_task_id",
-        "idolBaseSha",
-        "idol_base_sha",
-    }
-    return {key: value.get(key) for key in allowed if value.get(key) not in (None, "")}
-
-
-def session_row(value: Any) -> Mapping[str, Any] | None:
-    if not isinstance(value, Mapping):
-        return None
-    meta = metadata(value)
-    session_id = pick(value, "id", "sessionId", "session_id", "key")
-    status = pick(value, "status", "state", "phase")
-    if value.get("hasActiveRun") is True or value.get("hasActiveSubagentRun") is True:
-        status = "running"
-    if session_id is None or status is None:
-        return None
-    usage = value.get("usage") if isinstance(value.get("usage"), Mapping) else {}
-    model = pick(value, "model", "modelId", "model_id") or pick(usage, "model", "modelId")
-    provider = pick(value, "provider", "providerId", "provider_id", "modelProvider") or pick(usage, "provider", "providerId")
-    row = {
-        "id": str(session_id),
-        "status": str(status).lower(),
-        "last_activity": timestamp(pick(value, "updatedAt", "updated_at", "lastActivityAt", "last_activity")),
-        "provider": text(provider),
-        "model": text(model),
-        "attempt_id": str(pick(meta, "idolAttemptId", "idol_attempt_id")) if pick(meta, "idolAttemptId", "idol_attempt_id") else None,
-        "order_id": str(pick(meta, "idolOrderId", "idol_order_id")) if pick(meta, "idolOrderId", "idol_order_id") else None,
-        "task_id": str(pick(meta, "idolTaskId", "idol_task_id")) if pick(meta, "idolTaskId", "idol_task_id") else None,
-        "base_sha": str(pick(meta, "idolBaseSha", "idol_base_sha")) if pick(meta, "idolBaseSha", "idol_base_sha") else None,
-        "host": text(pick(value, "host", "node", "placement")),
-        "actor": text(pick(value, "agentId", "agent_id", "actor")),
-    }
-    return {key: item for key, item in row.items() if item is not None}
 
 
 def argument(arguments: Sequence[str], *names: str) -> str | None:
@@ -266,60 +194,53 @@ def process_sessions(observed_at: float) -> list[Mapping[str, Any]]:
     return result
 
 
-def visible_gateway_sessions() -> list[Mapping[str, Any]]:
-    """Read every visible session page; this does not cover cron executions."""
-    result: list[Mapping[str, Any]] = []
-    seen: set[str] = set()
-    offset = 0
-    deadline = time.monotonic() + 20
-    for _ in range(50):
-        if time.monotonic() >= deadline:
-            raise RuntimeError("gateway session pagination exceeded its time bound")
-        page = call("sessions.list", {
-            "limit": 200, "offset": offset,
-            "includeGlobal": True, "includeUnknown": True,
-        })
-        items = page.get("sessions")
-        count, total, more = page.get("count"), page.get("totalCount"), page.get("hasMore")
-        if (
-            not isinstance(items, list)
-            or type(count) is not int or count != len(items)
-            or type(total) is not int or total < offset + count
-            or type(more) is not bool
-            or page.get("limitApplied") != 200
-            or type(page.get("limitApplied")) is not int
-            or (offset > 0 and "offset" not in page)
-            or ("offset" in page and (type(page["offset"]) is not int or page["offset"] != offset))
-            or "nextOffset" not in page
-            or len(items) > 200
-        ):
-            raise RuntimeError("gateway session pagination metadata is incomplete")
-        for item in items:
-            if not isinstance(item, Mapping):
-                raise RuntimeError("gateway session row is malformed")
-            key = item.get("key")
-            if not isinstance(key, str) or not key or key in seen:
-                raise RuntimeError("gateway session keys are missing or repeated")
-            if type(item.get("hasActiveRun")) is not bool or (
-                "hasActiveSubagentRun" in item and type(item["hasActiveSubagentRun"]) is not bool
-            ):
-                raise RuntimeError("gateway session activity metadata is incomplete")
-            seen.add(key)
-            row = session_row(item)
-            if row is not None:
-                result.append(row)
-        next_offset = page.get("nextOffset")
-        if not more:
-            if next_offset is not None or offset + count != total:
-                raise RuntimeError("gateway session pagination did not finish")
-            return result
-        if (
-            not items or type(next_offset) is not int
-            or next_offset != offset + count or next_offset >= total
-        ):
-            raise RuntimeError("gateway session pagination did not advance")
-        offset = next_offset
-    raise RuntimeError("gateway session pagination exceeded its page bound")
+ACTIVE_WORK_METHOD = "idol.fleet.activeWork.snapshot"
+ACTIVE_WORK_VERSION = "2026.8.1-beta.3"
+ACTIVE_WORK_COUNTERS = frozenset({
+    "queueSize", "pendingReplies", "embeddedRuns", "backgroundExecSessions",
+    "cronRuns", "activeTasks", "rootRequests", "sessionAdmissions",
+    "sessionMutations", "chatRuns", "queuedTurns", "terminalPersistence",
+    "terminalSessions",
+})
+MAX_SAFE_INTEGER = 2**53 - 1
+
+
+def require_gateway_idle() -> None:
+    """Require a fresh complete observation from the pinned gateway extension."""
+    started = time.time()
+    raw = call(ACTIVE_WORK_METHOD, {})
+    finished = time.time()
+    expected = {"schema", "version", "openclawVersion", "observedAt", "idle", "counts"}
+    if (
+        set(raw) != expected
+        or raw.get("schema") != "idol.openclaw.active-work"
+        or type(raw.get("version")) is not int or raw["version"] != 1
+        or raw.get("openclawVersion") != ACTIVE_WORK_VERSION
+        or type(raw.get("idle")) is not bool
+    ):
+        raise RuntimeError("OpenClaw execution snapshot contract is unavailable")
+    counts = raw.get("counts")
+    if (
+        not isinstance(counts, Mapping)
+        or set(counts) != ACTIVE_WORK_COUNTERS | {"totalActive"}
+        or any(type(value) is not int or not 0 <= value <= MAX_SAFE_INTEGER for value in counts.values())
+        or counts["totalActive"] != sum(counts[key] for key in ACTIVE_WORK_COUNTERS)
+        or raw["idle"] != (counts["totalActive"] == 0)
+    ):
+        raise RuntimeError("OpenClaw execution counters are incomplete or inconsistent")
+    observed = raw.get("observedAt")
+    if not isinstance(observed, str) or not re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", observed
+    ):
+        raise RuntimeError("OpenClaw execution snapshot time is invalid")
+    try:
+        observed_at = datetime.fromisoformat(observed[:-1] + "+00:00").timestamp()
+    except (ValueError, OverflowError):
+        raise RuntimeError("OpenClaw execution snapshot time is invalid") from None
+    if finished < started or not started - 1 <= observed_at <= finished + 1:
+        raise RuntimeError("OpenClaw execution snapshot is outside the observation window")
+    if not raw["idle"]:
+        raise RuntimeError("OpenClaw execution is active; additional admission is held")
 
 
 def unidentified_work(sessions: Sequence[Mapping[str, Any]]) -> bool:
@@ -365,17 +286,14 @@ def main() -> int:
                 agents=(),
             )
             return 0
-        sessions = [*visible_gateway_sessions(), *processes]
-        if unidentified_work(sessions):
-            emit_inventory(
-                observed_at=observed_at,
-                source="openclaw-visible-work-fence",
-                sessions=sessions,
-                agents=(),
-            )
-            return 0
-        # The gateway omits cron runs, including removed jobs that are still settling.
-        raise RuntimeError("OpenClaw cron execution coverage is unavailable; idleness is unproven")
+        require_gateway_idle()
+        emit_inventory(
+            observed_at=observed_at,
+            source="openclaw-active-work-snapshot",
+            sessions=processes,
+            agents=(),
+        )
+        return 0
     except Exception as exc:
         print(f"openclaw inventory refused: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

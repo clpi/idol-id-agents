@@ -1,0 +1,12 @@
+{
+  "name": "@idol/openclaw-fleet-snapshot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Authenticated read-only OpenClaw active-work snapshot for the IDOL fleet.",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ]
+  }
+}
