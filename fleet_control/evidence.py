@@ -183,7 +183,7 @@ def retain_candidate_evidence(
         or not content
         or len(content) > MAX_CANDIDATE_EVIDENCE_BYTES
     ):
-        raise EvidenceArtifactError("candidate evidence output is empty")
+        raise EvidenceArtifactError("candidate evidence output is outside the supported byte bounds")
     directory = _evidence_directory(state_dir)
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
