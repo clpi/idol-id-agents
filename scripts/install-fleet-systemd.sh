@@ -13,6 +13,7 @@ case "$INSTANCE" in ''|*[!A-Za-z0-9_-]*) echo "invalid fleet instance" >&2; exit
 case "$CONFIG" in /*) ;; *) echo "configuration path must be absolute" >&2; exit 2 ;; esac
 [ -f "$CONFIG" ] || { echo "configuration not found: $CONFIG" >&2; exit 2; }
 [ "$(uname -s)" = Linux ] || { echo "this installer is for Linux systemd --user" >&2; exit 2; }
+RECOVERY_POLICY=$("$ROOT/scripts/fleet-systemd-recovery.sh")
 PYTHON=${PYTHON:-$(command -v python3)}
 [ -n "$PYTHON" ] || { echo "python3 not found" >&2; exit 2; }
 SERVICE_PATH=${FLEET_SERVICE_PATH:-$PATH}
@@ -47,10 +48,12 @@ cd "$ROOT"
 "$PYTHON" -m fleet_control.cli --config "$CONFIG" run-once --mode observe-plan >/dev/null
 "$PYTHON" -m fleet_control.cli --config "$CONFIG" calibrate >/dev/null
 
-mkdir -p "$STATE/logs" "$HOME/.config/systemd/user"
-chmod 700 "$STATE" "$STATE/logs"
 SERVICE="idol-fleet-$INSTANCE.service"
 UNIT="$HOME/.config/systemd/user/$SERVICE"
+RECOVERY_DIR="$HOME/.config/systemd/user/$SERVICE.d"
+RECOVERY_UNIT="$RECOVERY_DIR/40-restart-backoff.conf"
+mkdir -p "$STATE/logs" "$HOME/.config/systemd/user" "$RECOVERY_DIR"
+chmod 700 "$STATE" "$STATE/logs"
 cat > "$UNIT" <<EOF
 [Unit]
 Description=IDOL and LIVE continuous fleet controller ($INSTANCE)
@@ -84,7 +87,8 @@ StandardError=append:$STATE/logs/controller.stderr.log
 [Install]
 WantedBy=default.target
 EOF
-chmod 600 "$UNIT"
+printf '%s\n' "$RECOVERY_POLICY" > "$RECOVERY_UNIT"
+chmod 600 "$UNIT" "$RECOVERY_UNIT"
 systemctl --user disable --now idol-fleet-observe.service >/dev/null 2>&1 || true
 systemctl --user daemon-reload
 systemctl --user enable "$SERVICE"
