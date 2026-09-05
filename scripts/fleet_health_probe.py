@@ -78,6 +78,7 @@ def service_batch(items, user, runner=subprocess.run):
         result[key] = {"healthy": healthy, "enabled": enabled, "active": active,
                        "load_state": loaded, "status": "timeout" if timed_out else "ok" if healthy else "mismatch"}
         if key.startswith("idol_fleet_"):
+            result[key]["manager"] = "user" if user else "system"
             modes = re.findall(r"(?:^|\s)--mode(?:=|\s+)(apply|observe-plan)(?=\s|;|$)",
                                fields.get("ExecStart", ""))
             result[key]["mode"] = modes[-1] if len(modes) == 1 else "unknown"
@@ -85,12 +86,23 @@ def service_batch(items, user, runner=subprocess.run):
 
 
 def services(runner=subprocess.run):
-    system = [item for item in SERVICES if not item[2]]
-    user = [item for item in SERVICES if item[2]]
+    manager = os.getenv("IDOL_HEALTH_FLEET_MANAGER", "user")
+    configured = []
+    invalid = {}
+    for key, name, user, expectation in SERVICES:
+        if key.startswith("idol_fleet_"):
+            if manager not in {"user", "system"}:
+                invalid[key] = {"healthy": False, "status": "invalid_manager",
+                                "mode": "unknown", "manager": "unknown"}
+                continue
+            user = manager == "user"
+        configured.append((key, name, user, expectation))
+    system = [item for item in configured if not item[2]]
+    user = [item for item in configured if item[2]]
     with ThreadPoolExecutor(max_workers=2) as pool:
         system_future = pool.submit(service_batch, system, False, runner)
         user_future = pool.submit(service_batch, user, True, runner)
-        return {**system_future.result(), **user_future.result()}
+        return {**system_future.result(), **user_future.result(), **invalid}
 
 
 def curl(spec, runner=subprocess.run):
