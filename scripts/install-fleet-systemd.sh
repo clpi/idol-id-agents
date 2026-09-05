@@ -184,11 +184,13 @@ for key in ("state_dir", "repository"):
     if safe_value.fullmatch(value) is None or "%" in value:
         raise SystemExit(f"{key} contains unsupported unit characters")
     print(value)
+print("true" if isinstance(inventory, dict) and inventory.get("enabled") is True else "false")
 PY
 ) || exit 2
 STATE=$(printf '%s\n' "$VALUES" | sed -n '1p')
 REPOSITORY=$(printf '%s\n' "$VALUES" | sed -n '2p')
-[ -z "$(printf '%s\n' "$VALUES" | sed -n '3p')" ] || {
+INVENTORY_ENABLED=$(printf '%s\n' "$VALUES" | sed -n '3p')
+[ -z "$(printf '%s\n' "$VALUES" | sed -n '4p')" ] || {
   echo "configuration validation returned unexpected data" >&2
   exit 2
 }
@@ -224,6 +226,34 @@ esac
 cd "$ROOT"
 run_as_service_user "$PYTHON" -m compileall -q fleet_control tests
 run_as_service_user "$PYTHON" -m unittest discover -s tests -v
+run_as_service_user mkdir -p "$STATE"
+run_as_service_user chmod 700 "$STATE"
+run_as_service_user "$PYTHON" - "$STATE/control" <<'PY'
+from pathlib import Path
+import sys
+from fleet_control.control import LocalControl
+control = LocalControl(Path(sys.argv[1]))
+status = control.status()
+if status.reason == "missing":
+    control.disable()
+elif not status.integrity_valid:
+    raise SystemExit("existing local control state is invalid")
+PY
+INVENTORY_WRITE_PATH=
+if [ "$INVENTORY_ENABLED" = true ]; then
+  INVENTORY_STATE="$SERVICE_HOME/.local/state/idol-fleet-inventory"
+  require_unit_value "$INVENTORY_STATE" "shared inventory state directory"
+  run_as_service_user mkdir -p "$SERVICE_HOME/.local/state"
+  run_as_service_user "$PYTHON" - "$ROOT/scripts" "$INVENTORY_STATE" <<'PY'
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from inventory_snapshot_lock import inventory_snapshot_lock
+with inventory_snapshot_lock(state_directory=Path(sys.argv[2])):
+    pass
+PY
+  INVENTORY_WRITE_PATH=" $INVENTORY_STATE"
+fi
 run_as_service_user "$PYTHON" -m fleet_control.cli --config "$CONFIG" run-once --mode observe-plan >/dev/null
 run_as_service_user "$PYTHON" -m fleet_control.cli --config "$CONFIG" calibrate >/dev/null
 
@@ -274,7 +304,7 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
-ReadWritePaths=$STATE $REPOSITORY
+ReadWritePaths=$STATE $REPOSITORY$INVENTORY_WRITE_PATH
 StandardOutput=append:$STATE/logs/controller.stdout.log
 StandardError=append:$STATE/logs/controller.stderr.log
 

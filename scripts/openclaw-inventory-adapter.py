@@ -13,6 +13,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 from codex_inventory import observe_codex, scan_processes
+from inventory_snapshot_lock import inventory_snapshot_lock
 from openclaw_transport import observe_local_gateway
 
 
@@ -252,47 +253,49 @@ def unidentified_work(sessions: Sequence[Mapping[str, Any]]) -> bool:
     )
 
 
-def emit_inventory(
+def inventory_payload(
     *,
     observed_at: float,
     source: str,
     sessions: Sequence[Mapping[str, Any]],
     agents: Sequence[Mapping[str, Any]],
-) -> None:
-    print(
-        json.dumps(
-            {
-                "schema": "idol.fleet.inventory.v1",
-                "observed_at": observed_at,
-                "source": source,
-                "sessions": sessions,
-                "agents": agents,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+) -> str:
+    return json.dumps(
+        {
+            "schema": "idol.fleet.inventory.v1",
+            "observed_at": observed_at,
+            "source": source,
+            "sessions": sessions,
+            "agents": agents,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
-def main() -> int:
-    try:
+def observe_inventory() -> str:
+    with inventory_snapshot_lock():
         observed_at = time.time()
         processes = process_sessions(observed_at)
         if unidentified_work(processes):
-            emit_inventory(
+            return inventory_payload(
                 observed_at=observed_at,
                 source="local-process-fast-fence",
                 sessions=processes,
                 agents=(),
             )
-            return 0
         require_gateway_idle()
-        emit_inventory(
+        return inventory_payload(
             observed_at=observed_at,
             source="openclaw-active-work-snapshot",
             sessions=processes,
             agents=(),
         )
+
+
+def main() -> int:
+    try:
+        print(observe_inventory())
         return 0
     except Exception as exc:
         print(f"openclaw inventory refused: {type(exc).__name__}: {exc}", file=sys.stderr)

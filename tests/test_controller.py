@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import hashlib
 import json
@@ -8,16 +9,19 @@ from pathlib import Path
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 from fleet_control.calibration import calibrate
 from fleet_control.controller import ControllerError, FleetController, load_config
+from fleet_control.control import LocalControl
 from fleet_control.evidence import retain_candidate_evidence
 from fleet_control.gitops import GitRefusal, current_sha
 from fleet_control.health import record_failure
 from fleet_control.model import stable_hash
 from fleet_control.runtime import RunResult
+from tests.process_helpers import process_stopped
 
 
 class ControllerTests(unittest.TestCase):
@@ -32,7 +36,7 @@ class ControllerTests(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def fixture(self, *, mode: str, outside: bool = False):
+    def fixture(self, *, mode: str, outside: bool = False, control_enabled: bool = True):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
         repo = root / "idol"
@@ -151,6 +155,8 @@ class ControllerTests(unittest.TestCase):
                 output=calibration_path,
                 ttl_seconds=600,
             )
+            if control_enabled:
+                LocalControl(state / "control").enable(ttl_seconds=600)
         claim_log = root / "claims.log"
         claim_log.write_text("")
         return temporary, root, repo, state, config_path, agent, claim_log
@@ -852,6 +858,192 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(event["kind"], "fleet.base.fast-forwarded")
             self.assertEqual(event["fact"]["rebound_orders"], [])
             self.assertIn("t_controller_1", event["fact"]["rebind_refusals"])
+
+
+    def test_missing_control_blocks_apply_without_claims_or_attempts(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply", control_enabled=False)
+        with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+            controller = FleetController(config_path=config)
+            result = controller.run_once()
+            self.assertEqual(result.attempts, ())
+            self.assertFalse((state / "control").exists())
+            self.assertFalse((state / "worktrees").exists())
+            self.assertEqual(log.read_text(), "")
+            self.assertEqual(controller.semantic_claims.list(), ())
+            self.assertFalse(any(row["kind"].startswith("attempt.") for row in controller.journal.verify()))
+
+    def test_enabled_control_does_not_override_observe_mode(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+        with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+            controller = FleetController(config_path=config, mode_override="observe-plan")
+            with mock.patch.object(controller.runtime, "execute") as execute:
+                result = controller.run_once()
+            self.assertEqual(result.attempts, ())
+            execute.assert_not_called()
+            self.assertEqual(log.read_text(), "")
+
+    def test_disable_is_checked_again_at_first_claim_boundary(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+        with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+            controller = FleetController(config_path=config)
+            transition = controller.control.transition_permit
+
+            def disable_before_claim(boundary, token=None):
+                if boundary == "claim" and token is None:
+                    controller.control.disable()
+                return transition(boundary, token)
+
+            with mock.patch.object(controller.control, "transition_permit", side_effect=disable_before_claim):
+                result = controller.run_once()
+            self.assertEqual(result.attempts, ())
+            self.assertEqual(log.read_text(), "")
+            self.assertFalse(any(row["kind"].startswith("attempt.") for row in controller.journal.verify()))
+
+    def test_disable_at_worktree_or_process_boundary_cleans_owned_claims(self) -> None:
+        for stopped_boundary in ("worktree", "process"):
+            with self.subTest(boundary=stopped_boundary):
+                temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+                with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+                    controller = FleetController(config_path=config)
+                    transition = controller.control.transition_permit
+
+                    def disable_before_boundary(boundary, token=None):
+                        if boundary == stopped_boundary:
+                            controller.control.disable()
+                        return transition(boundary, token)
+
+                    with mock.patch.object(controller.control, "transition_permit", side_effect=disable_before_boundary):
+                        result = controller.run_once()
+                    self.assertEqual(result.attempts[0]["error_type"], "ControlRefusal")
+                    self.assertFalse(result.attempts[0]["retryable_route_failure"])
+                    self.assertEqual(controller.semantic_claims.list(), ())
+                    self.assertEqual(controller.path_claims.list(), ())
+                    self.assertIn("acquire ", log.read_text())
+                    self.assertIn("release ", log.read_text())
+                    rows = controller.journal.verify()
+                    self.assertFalse(any(row["kind"] == "attempt.executed" for row in rows))
+                    if stopped_boundary == "worktree":
+                        self.assertFalse((state / "worktrees").exists())
+                    else:
+                        worktree = Path(result.attempts[0]["worktree"])
+                        self.assertEqual((worktree / "src/ok.txt").read_text(), "base\n")
+
+    def test_drain_preserves_owned_attempt_through_witness_claim_renewal(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+        with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+            controller = FleetController(config_path=config)
+            transition = controller.control.transition_permit
+
+            def drain_before_worktree(boundary, token=None):
+                if boundary == "worktree":
+                    controller.control.drain()
+                return transition(boundary, token)
+
+            with mock.patch.object(controller.control, "transition_permit", side_effect=drain_before_worktree):
+                result = controller.run_once()
+            self.assertIn("commit", result.attempts[0])
+            self.assertEqual(controller.control.status().mode, "draining")
+            self.assertEqual(controller.run_once().attempts, ())
+            self.assertEqual(controller.semantic_claims.list(), ())
+            self.assertEqual(controller.path_claims.list(), ())
+
+    def test_disable_during_final_witness_prevents_commit_push_and_pr(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+        with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+            started = root / "witness-started"
+            release = root / "witness-release"
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            order.update(publish_branch=True, create_draft_pr=True)
+            order["witnesses"] = [["python3", "-c",
+                "from pathlib import Path; import time\n"
+                f"Path({str(started)!r}).touch()\n"
+                "deadline=time.monotonic()+10\n"
+                f"while not Path({str(release)!r}).exists():\n"
+                "    assert time.monotonic() < deadline\n"
+                "    time.sleep(0.01)\n",
+            ]]
+            order_path.write_text(json.dumps(order))
+            controller = FleetController(config_path=config)
+            with (mock.patch("fleet_control.controller.commit_claimed") as commit,
+                  mock.patch("fleet_control.controller.publish_branch") as push,
+                  mock.patch("fleet_control.controller.create_draft_pull_request") as pr,
+                  ThreadPoolExecutor(max_workers=1) as executor):
+                future = executor.submit(controller.run_once)
+                try:
+                    deadline = time.monotonic() + 10
+                    while not started.exists() and not future.done() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(started.exists(), "final witness never started")
+                    controller.control.disable()
+                finally:
+                    release.touch()
+                result = future.result(timeout=15)
+                commit.assert_not_called()
+                push.assert_not_called()
+                pr.assert_not_called()
+            self.assertEqual(result.attempts[0]["error_type"], "ControlRefusal")
+            self.assertEqual(current_sha(Path(result.attempts[0]["worktree"])), order["base_sha"])
+            self.assertFalse(any(row["kind"] == "attempt.ready" for row in controller.journal.verify()))
+            self.assertEqual(controller.semantic_claims.list(), ())
+            self.assertEqual(controller.path_claims.list(), ())
+
+    def test_disable_after_fetch_prevents_authority_and_order_mutation(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+        with temporary:
+            writer = self.add_remote(root, repo)
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            order["follow_remote_main"] = True
+            order_path.write_text(json.dumps(order))
+            original_order = order_path.read_bytes()
+            self.enable_remote_tracking(config, auto_fast_forward=True)
+            (writer / "src/unrelated.txt").write_text("remote\n")
+            self.git(writer, "add", "src/unrelated.txt")
+            self.git(writer, "commit", "-m", "remote change")
+            self.git(writer, "push", "origin", "main")
+            controller = FleetController(config_path=config)
+            from fleet_control.gitops import fetch_remote_branch
+
+            def fetch_then_disable(*args, **kwargs):
+                new_sha = fetch_remote_branch(*args, **kwargs)
+                controller.control.disable()
+                return new_sha
+
+            with mock.patch("fleet_control.controller.fetch_remote_branch", side_effect=fetch_then_disable):
+                controller.refresh_remote_base()
+            self.assertEqual(current_sha(repo), order["base_sha"])
+            self.assertEqual(order_path.read_bytes(), original_order)
+            refusal = controller.journal.verify()[-1]
+            self.assertEqual(refusal["kind"], "fleet.base.refresh-refused")
+            self.assertEqual(refusal["fact"]["error_type"], "ControlRefusal")
+
+    def test_witness_timeout_kills_descendant_after_parent_exits(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+        with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+            child_path = root / "witness-descendant.pid"
+            order_path = state / "work-orders/t_controller_1.json"
+            order = json.loads(order_path.read_text())
+            order["witnesses"] = [["python3", "-c",
+                "import pathlib, subprocess\n"
+                "child=subprocess.Popen(['sleep', '30'])\n"
+                f"pathlib.Path({str(child_path)!r}).write_text(str(child.pid))\n",
+            ]]
+            order_path.write_text(json.dumps(order))
+            raw = json.loads(config.read_text())
+            raw["witness_timeout_seconds"] = 10
+            config.write_text(json.dumps(raw))
+            parsed_raw, parsed = load_config(config)
+            calibrate(raw_config=parsed_raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
+            controller = FleetController(config_path=config)
+            started = time.monotonic()
+            result = controller.run_once()
+            self.assertLess(time.monotonic() - started, 14)
+            self.assertEqual(result.attempts[0]["error_type"], "TimeoutExpired")
+            self.assertTrue(process_stopped(int(child_path.read_text())), "witness descendant survived timeout cleanup")
+            self.assertEqual(controller.semantic_claims.list(), ())
+            self.assertEqual(controller.path_claims.list(), ())
+            self.assertFalse(any(row["kind"] == "attempt.ready" for row in controller.journal.verify()))
 
 
 if __name__ == "__main__":

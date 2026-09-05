@@ -5,7 +5,9 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
-from typing import Iterable, Sequence
+from typing import Callable, ContextManager, Iterable, Sequence
+
+from .processes import kill_group_and_reap
 
 
 class GitRefusal(RuntimeError):
@@ -15,6 +17,8 @@ class GitRefusal(RuntimeError):
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,239}$")
+
+LaunchGuard = Callable[[], ContextManager[object]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +46,76 @@ def run(
         check=False,
     )
     if check and result.returncode != 0:
+        raise GitRefusal(result.stdout.strip() or f"git {' '.join(arguments)} failed")
+    return result
+
+
+def _run_guarded_process(
+    command: Sequence[str],
+    *,
+    repository: Path,
+    timeout: int,
+    stderr: int,
+    launch_guard: LaunchGuard | None,
+) -> subprocess.CompletedProcess[str]:
+    if launch_guard is None:
+        return subprocess.run(
+            command,
+            cwd=repository,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    process: subprocess.Popen[str] | None = None
+    try:
+        with launch_guard():
+            process = subprocess.Popen(
+                command,
+                cwd=repository,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=stderr,
+                text=True,
+                start_new_session=True,
+            )
+    except BaseException:
+        if process is not None:
+            try:
+                kill_group_and_reap(process)
+            except BaseException:
+                pass
+        raise
+
+    assert process is not None
+    try:
+        stdout, process_stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        stdout, process_stderr = kill_group_and_reap(process)
+        exc.stdout = stdout
+        exc.stderr = process_stderr
+        raise
+    return subprocess.CompletedProcess(command, process.returncode, stdout, process_stderr)
+
+
+def _run_mutating_git(
+    repository: Path,
+    arguments: Sequence[str],
+    *,
+    launch_guard: LaunchGuard | None,
+    timeout: int = 120,
+) -> subprocess.CompletedProcess[str]:
+    result = _run_guarded_process(
+        ["git", *arguments],
+        repository=repository,
+        timeout=timeout,
+        stderr=subprocess.STDOUT,
+        launch_guard=launch_guard,
+    )
+    if result.returncode != 0:
         raise GitRefusal(result.stdout.strip() or f"git {' '.join(arguments)} failed")
     return result
 
@@ -231,20 +305,44 @@ def commit_claimed(
     message: str,
     author_name: str,
     author_email: str,
+    launch_guard: LaunchGuard | None = None,
 ) -> str:
     if not paths:
         raise GitRefusal("cannot commit an empty attempt")
-    run(repository, ("config", "user.name", author_name))
-    run(repository, ("config", "user.email", author_email))
-    run(repository, ("add", "--", *paths))
+    _run_mutating_git(
+        repository,
+        ("config", "user.name", author_name),
+        launch_guard=launch_guard,
+    )
+    _run_mutating_git(
+        repository,
+        ("config", "user.email", author_email),
+        launch_guard=launch_guard,
+    )
+    _run_mutating_git(repository, ("add", "--", *paths), launch_guard=launch_guard)
     if run(repository, ("diff", "--cached", "--quiet"), check=False).returncode == 0:
         raise GitRefusal("claimed paths contain no staged change")
-    run(repository, ("commit", "-m", message), timeout=180)
+    _run_mutating_git(
+        repository,
+        ("commit", "-m", message),
+        launch_guard=launch_guard,
+        timeout=180,
+    )
     return current_sha(repository)
 
 
-def publish_branch(repository: Path, branch: str) -> None:
-    run(repository, ("push", "--porcelain", "--set-upstream", "origin", branch), timeout=300)
+def publish_branch(
+    repository: Path,
+    branch: str,
+    *,
+    launch_guard: LaunchGuard | None = None,
+) -> None:
+    _run_mutating_git(
+        repository,
+        ("push", "--porcelain", "--set-upstream", "origin", branch),
+        launch_guard=launch_guard,
+        timeout=300,
+    )
 
 
 def create_draft_pull_request(
@@ -254,6 +352,7 @@ def create_draft_pull_request(
     base: str,
     title: str,
     body_path: Path,
+    launch_guard: LaunchGuard | None = None,
 ) -> str:
     existing = subprocess.run(
         ["gh", "pr", "list", "--head", branch, "--state", "open", "--json", "url"],
@@ -275,7 +374,7 @@ def create_draft_pull_request(
         url = rows[0].get("url") if isinstance(rows[0], dict) else None
         if isinstance(url, str) and url:
             return url
-    result = subprocess.run(
+    result = _run_guarded_process(
         [
             "gh",
             "pr",
@@ -290,13 +389,10 @@ def create_draft_pull_request(
             "--body-file",
             str(body_path),
         ],
-        cwd=repository,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
+        repository=repository,
         stderr=subprocess.PIPE,
-        text=True,
         timeout=120,
-        check=False,
+        launch_guard=launch_guard,
     )
     if result.returncode != 0:
         raise GitRefusal(result.stderr.strip() or "gh pr create failed")

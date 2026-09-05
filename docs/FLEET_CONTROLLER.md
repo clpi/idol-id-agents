@@ -60,6 +60,10 @@ Routes authenticate using either local model execution, a witnessed subscription
 
 ## Local session inventory
 
+Both local controllers serialize the complete fresh process scan and gateway snapshot through the same private `~/.local/state/idol-fleet-inventory/snapshot.lock`. This prevents their own overlapping snapshot RPCs from counting one another as active gateway requests. Each caller still obtains and validates its own fresh observation; no payload cache, saved-session fallback, or new collaboration authority is introduced. The lock waits at most eight seconds, releases on process death, and validates same-account ownership, directory mode 0700, lock mode 0600, regular/single-link identity, and path/descriptor binding before publishing a result. A timeout or observed replacement refuses inventory. Other active or unidentified work still fences dispatch.
+
+On Linux, provision that directory before starting either protected service and add exactly this shared metadata directory to both existing `ReadWritePaths` lists. Keep `ProtectSystem=strict` and all other restrictions. The adapter supports an explicit `IDOL_FLEET_INVENTORY_STATE_DIR` for direct invocations; fleet services use the common HOME-based default. The lock detects in-flight replacement; it is not protection against a trusted same-UID or root actor deliberately bypassing the protocol.
+
 `scripts/openclaw-inventory-adapter.py` fences standalone agent processes and actual active Codex turns. It recognizes the installed Codex 0.152.0 app-server listener and its proxies only after a complete process scan, same-user socket ownership, kernel listener/PID binding, executable identity, daemon/CLI version agreement, and a bracketed native protocol query. The query initializes the existing Unix WebSocket daemon, follows every loaded-thread page, and reads each loaded thread with `includeTurns: false`. Verified idle threads are omitted; active threads remain unidentified work until an authoritative order/task binding exists. A proxy alone, unknown version, ambiguous listener, malformed response, changed identity, or unavailable query refuses inventory. No daemon is started, stopped, or reconfigured.
 
 Process exclusions bind both PID and process start time. Thread title, preview, messages, and raw protocol responses are never serialized. `includeTurns: false` can still return incidental thread preview fields; only the approved identity/activity fields reach the controller. This is a point-in-time observation, not an atomic reservation against a new interactive turn starting later. Dispatch still requires the controller's claim and admission checks.
@@ -70,7 +74,33 @@ The extension is an unsupported private-API bridge pinned to one installed OpenC
 
 ## Deployment
 
+### Additional local control
+
+The controller is disabled for new dispatch by default, including when the control directory is absent. An explicit local control is an additional necessary gate: configuration mode, service observation holds, current calibration, route proofs, allowance, canonical claims, and work orders still apply. Enabling this gate does not authorize a route, spending, resets, source changes, publication, or merges.
+
+Use the existing controller command with its exact private configuration:
+
+```sh
+idol-fleet --config /absolute/fleet.json control status
+idol-fleet --config /absolute/fleet.json control enable --ttl-seconds 3600
+idol-fleet --config /absolute/fleet.json control refresh --ttl-seconds 3600
+idol-fleet --config /absolute/fleet.json control drain
+idol-fleet --config /absolute/fleet.json control disable
+```
+
+Enable leases last 30 seconds to 24 hours. Expiry stops new admission; refresh is explicit. Drain rejects new attempts while preserving already-owned bounded attempts in the same enable epoch. Disable invalidates those permits at later boundaries. After drain, explicitly disable before enabling a new epoch. Existing route, witness, and claim timeouts bound owned work; extending an admission lease does not extend those execution limits.
+
+The control lock brackets local claim mutations, repository-claim acquire/renew launches, worktree creation, provider and witness launches, and finalization mutations and readiness. Disable linearizes against those operations: a launch that wins the lock has already started; a disable that wins prevents it. The lock is released immediately after a provider or claim-command process starts. Already-started child operations may complete; later boundaries recheck the current control. Witness launches are checked too, and claim cleanup remains available after disable. This is an admission kill switch, not retroactive termination of an already-launched process.
+
+Automatic fast-forward, when separately configured, checks the control before remote refresh, then authenticates again immediately before changing the authority checkout. Remote fetch does not hold the control lock. The bounded fast-forward and order rebinding share a maintenance guard: disable that wins first prevents both; an already-admitted maintenance transaction finishes before disable returns. Drain and expired admission leases refuse new maintenance.
+
+After the final witness, the controller authenticates the owned attempt again. Every commit, push, and pull-request creation launch has its own guard, and recording readiness is guarded too. Disable while a witness runs prevents subsequent finalization; drain can finish the already-owned attempt. A publication process launched before disable may still complete under its existing timeout.
+
+State lives under the controller's existing private state directory in `control/`. The directory is 0700; state, key, and stable lock/anchor records are 0600. Signed state binds generation and actual file identity, while the anchor rejects replay or unauthorized replacement. Updates use atomic replacement and fsync under one exclusive lock; interruption between state and anchor commits fails closed. Missing, partial, malformed, insecure, stale-for-new-admission, or tampered state never silently becomes enabled. Status is read-only. Ordinary operations refuse corrupt records instead of repairing them. The local key detects operational corruption within the private-account boundary; it cannot protect against a same-UID or root actor rewriting all trusted artifacts.
+
 The observer installers install only `observe-plan`. On Linux, `scripts/install-fleet-systemd.sh CONFIG INSTANCE` is the explicit production transition for configurations without live process inventory. With live inventory, use the system-manager installation described below. The installer requires an `apply` configuration with safe automatic proof refresh, runs the full no-inference test suite, executes one observe-only cycle, calibrates every enabled route, disables the user-manager observer service, and starts a supervised `idol-fleet-INSTANCE.service` loop. Separate IDOL and LIVE instances use disjoint route capacity and private state so one long bounded run cannot starve the other repository.
+
+The installer initializes an absent local control as disabled and preserves an existing valid control record. It refuses invalid state. It never enables or refreshes the local gate. Keep both `50-calibration-hold.conf` overrides during a held deployment and verify real service cycles, private control state, unchanged queues, zero claims, and zero model attempts before declaring that deployment complete.
 
 Both Linux installers resolve a systemd-version-specific recovery policy before changing unit files or service state and write it as a separate `40-restart-backoff.conf` drop-in. On systemd 254 and newer, a failed service retries after 30 seconds and increases its delay over six steps to a 15-minute ceiling. Older releases use a portable fixed five-minute delay. Start rate limiting is disabled so repeated failures do not permanently latch the service; invalid version output refuses installation before mutation. This policy applies only after the service process exits: an explicit `systemctl stop` remains stopped, and later mode drop-ins such as `50-calibration-hold.conf` remain authoritative.
 

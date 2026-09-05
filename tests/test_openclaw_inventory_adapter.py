@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 import copy
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -45,6 +49,18 @@ def snapshot(**active):
 
 
 class OpenClawInventoryAdapterTests(unittest.TestCase):
+    @contextmanager
+    def isolated_main_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            isolated_home = Path(temporary) / "home"
+            isolated_home.mkdir()
+            default_state = isolated_home / ".local/state/idol-fleet-inventory"
+            with mock.patch.dict(os.environ, {"HOME": str(isolated_home)}), mock.patch.object(
+                adapter, "inventory_snapshot_lock", return_value=nullcontext()
+            ):
+                yield
+            self.assertFalse(default_state.exists())
+
     def test_gateway_call_uses_one_bounded_form(self):
         result = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(snapshot()))
         with mock.patch.object(adapter, "openclaw_command", return_value=["openclaw"]), mock.patch.object(
@@ -76,10 +92,13 @@ class OpenClawInventoryAdapterTests(unittest.TestCase):
 
     def run_main(self, raw, processes=()):
         output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(adapter, "process_sessions", return_value=list(processes)), mock.patch.object(
-            adapter, "call", return_value=raw
-        ) as call, mock.patch.object(adapter.time, "time", return_value=NOW), redirect_stdout(output), redirect_stderr(errors):
-            code = adapter.main()
+        with self.isolated_main_lock():
+            with mock.patch.object(adapter, "process_sessions", return_value=list(processes)), mock.patch.object(
+                adapter, "call", return_value=raw
+            ) as call, mock.patch.object(adapter.time, "time", return_value=NOW), redirect_stdout(
+                output
+            ), redirect_stderr(errors):
+                code = adapter.main()
         return code, output.getvalue(), errors.getvalue(), call
 
     def test_complete_idle_snapshot_emits_only_process_metadata(self):
@@ -174,10 +193,11 @@ class OpenClawInventoryAdapterTests(unittest.TestCase):
     def test_unknown_method_timeout_and_error_refuse_without_fallback(self):
         for failure in (RuntimeError("unknown method"), RuntimeError("gateway timeout")):
             output, errors = io.StringIO(), io.StringIO()
-            with mock.patch.object(adapter, "process_sessions", return_value=[]), mock.patch.object(
-                adapter, "call", side_effect=failure
-            ) as call, redirect_stdout(output), redirect_stderr(errors):
-                self.assertEqual(adapter.main(), 2)
+            with self.isolated_main_lock():
+                with mock.patch.object(adapter, "process_sessions", return_value=[]), mock.patch.object(
+                    adapter, "call", side_effect=failure
+                ) as call, redirect_stdout(output), redirect_stderr(errors):
+                    self.assertEqual(adapter.main(), 2)
             call.assert_called_once_with("idol.fleet.activeWork.snapshot", {})
             self.assertEqual(output.getvalue(), "")
 
@@ -206,15 +226,66 @@ class OpenClawInventoryAdapterTests(unittest.TestCase):
         active = {"id": "codex-thread-one", "status": "running", "actor": "codex-cli"}
         observation = SimpleNamespace(processes=(), covered_processes=frozenset(), sessions=(active,))
         output = io.StringIO()
-        with mock.patch.object(adapter, "scan_processes", return_value=()), mock.patch.object(
-            adapter, "observe_codex", return_value=observation
-        ), mock.patch.object(adapter, "call") as call, redirect_stdout(output):
-            self.assertEqual(adapter.main(), 0)
+        with self.isolated_main_lock():
+            with mock.patch.object(adapter, "scan_processes", return_value=()), mock.patch.object(
+                adapter, "observe_codex", return_value=observation
+            ), mock.patch.object(adapter, "call") as call, redirect_stdout(output):
+                self.assertEqual(adapter.main(), 0)
         call.assert_not_called()
         self.assertEqual(json.loads(output.getvalue())["sessions"], [active])
 
     def test_kimi_code_process_is_fenced(self):
         self.assertEqual(adapter.process_actor(["/home/clp/.local/bin/kimi-code", "--session", "one"]), "kimi-cli")
+
+    def test_overlapping_full_observations_are_serialized(self):
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+        start = threading.Barrier(3)
+
+        def observed_processes(observed_at):
+            nonlocal active, maximum
+            self.assertEqual(observed_at, NOW)
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            return []
+
+        def observed_snapshot(method, params):
+            nonlocal active
+            self.assertEqual((method, params), (adapter.ACTIVE_WORK_METHOD, {}))
+            time.sleep(0.05)
+            with guard:
+                active -= 1
+            return snapshot()
+
+        def observe(results):
+            start.wait()
+            results.append(json.loads(adapter.observe_inventory()))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary).resolve() / "shared-inventory"
+            results = []
+            with mock.patch.dict(
+                os.environ,
+                {"IDOL_FLEET_INVENTORY_STATE_DIR": str(state)},
+            ), mock.patch.object(adapter, "process_sessions", side_effect=observed_processes), mock.patch.object(
+                adapter, "call", side_effect=observed_snapshot
+            ) as call, mock.patch.object(adapter.time, "time", return_value=NOW):
+                threads = [threading.Thread(target=observe, args=(results,)) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                start.wait()
+                for thread in threads:
+                    thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(maximum, 1)
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual([row["source"] for row in results], [
+            "openclaw-active-work-snapshot", "openclaw-active-work-snapshot",
+        ])
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from .calibration import (
     require_current_route_proof,
 )
 from .claims import ControllerLease, RepositoryClaimTransaction, SemanticClaimStore
+from .control import ControlRefusal, LocalControl
 from .evidence import retain_candidate_evidence
 from .gitops import (
     GitRefusal,
@@ -42,6 +43,7 @@ from .health import apply_circuits, circuit_state, record_failure, record_succes
 from .journal import Journal
 from .model import Assignment, Route, WorkOrder, load_routes, mapping, sequence, stable_hash
 from .policy import assert_order_route
+from .processes import kill_group_and_reap
 from .performance import route_factors
 from .runtime import CommandRuntime, RuntimeRefusal
 from .scheduler import Plan, Rejection, build_plan
@@ -194,7 +196,8 @@ class FleetController:
         self.journal = Journal(self.config.state_dir / "fleet-history.jsonl")
         self.semantic_claims = SemanticClaimStore(self.config.state_dir / "claims")
         self.path_claims = SemanticClaimStore(self.config.state_dir / "path-claims")
-        self.runtime = CommandRuntime(self.config.state_dir / "runtime")
+        self.control = LocalControl(self.config.state_dir / "control")
+        self.runtime = CommandRuntime(self.config.state_dir / "runtime", control=self.control)
         self.lease_path = self.config.state_dir / "controller.lock"
 
     @staticmethod
@@ -452,7 +455,8 @@ class FleetController:
                 temporary.unlink()
 
     def refresh_remote_base(self) -> None:
-        if not self.config.remote_head_required or self.config.mode != "apply" or not self.config.auto_fast_forward:
+        if (not self.config.remote_head_required or self.config.mode != "apply"
+                or not self.config.auto_fast_forward or not self.control.status().permitted):
             return
         observed_at = time.time()
         old_sha: str | None = None
@@ -497,25 +501,26 @@ class FleetController:
                     held[order.id] = "watched-path-changed"
                     continue
                 rebound.append((path, order.id, stable_hash(raw)))
-            fast_forward(
-                self.config.repository,
-                branch=self.config.base_branch,
-                new_sha=new_sha,
-            )
-            moved = True
             rebound_orders: list[str] = []
             rebind_refusals: dict[str, str] = {}
-            for path, order_id, expected_hash in rebound:
-                try:
-                    self._write_rebound_order(
-                        path,
-                        old_sha=old_sha,
-                        new_sha=new_sha,
-                        expected_hash=expected_hash,
-                    )
-                    rebound_orders.append(order_id)
-                except Exception as exc:
-                    rebind_refusals[order_id] = f"{type(exc).__name__}: {exc}"
+            with self.control.transition_permit("maintenance"):
+                fast_forward(
+                    self.config.repository,
+                    branch=self.config.base_branch,
+                    new_sha=new_sha,
+                )
+                moved = True
+                for path, order_id, expected_hash in rebound:
+                    try:
+                        self._write_rebound_order(
+                            path,
+                            old_sha=old_sha,
+                            new_sha=new_sha,
+                            expected_hash=expected_hash,
+                        )
+                        rebound_orders.append(order_id)
+                    except Exception as exc:
+                        rebind_refusals[order_id] = f"{type(exc).__name__}: {exc}"
             self.journal.append(
                 "fleet.base.fast-forwarded",
                 {
@@ -760,6 +765,7 @@ class FleetController:
         worktree: Path,
         *,
         renew_claims,
+        attempt_permit,
     ) -> tuple[Mapping[str, Any], ...]:
         rows: list[Mapping[str, Any]] = []
         for command in order.witnesses:
@@ -769,20 +775,27 @@ class FleetController:
                 for part in command
             ]
             started = time.time()
-            result = subprocess.run(
-                rendered,
-                cwd=worktree,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=self.config.witness_timeout_seconds,
-                check=False,
-            )
-            output = result.stdout[:1_000_000]
+            process = None
+            try:
+                with self.control.transition_permit("process", attempt_permit):
+                    process = subprocess.Popen(
+                        rendered,
+                        cwd=worktree,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        start_new_session=True,
+                    )
+                output, _ = process.communicate(timeout=self.config.witness_timeout_seconds)
+            except BaseException:
+                if process is not None:
+                    kill_group_and_reap(process)
+                raise
+            output = output[:1_000_000]
             row = {
                 "command": rendered,
-                "returncode": result.returncode,
+                "returncode": process.returncode,
                 "started_at": started,
                 "ended_at": time.time(),
                 "output_hash": hashlib.sha256(output.encode()).hexdigest(),
@@ -790,7 +803,7 @@ class FleetController:
             }
             rows.append(row)
             self.journal.append("attempt.witnessed", {"order_id": order.id, **row})
-            if result.returncode != 0:
+            if process.returncode != 0:
                 raise ControllerError(f"witness failed for {order.id}: {rendered!r}")
         return tuple(rows)
 
@@ -826,7 +839,9 @@ class FleetController:
             os.fsync(handle.fileno())
         return path
 
-    def dispatch(self, assignment: Assignment) -> Mapping[str, Any]:
+    def dispatch(self, assignment: Assignment) -> Mapping[str, Any] | None:
+        if self.config.mode != "apply" or not self.control.status().permitted:
+            return None
         order = assignment.order
         route = assignment.route
         try:
@@ -886,24 +901,29 @@ class FleetController:
             "branch": branch,
             "worktree": str(worktree),
         }
-        self.journal.append("attempt.started", fact)
+        started = False
         semantic_acquired = False
         paths_acquired = False
         try:
-            self.semantic_claims.acquire(
-                owner=owner,
-                task_id=order.task_id,
-                targets=order.semantic_claims,
-                ttl_seconds=self.config.claim_ttl_seconds,
-            )
-            semantic_acquired = True
-            self.path_claims.acquire(
-                owner=owner,
-                task_id=work_item,
-                targets=path_targets,
-                ttl_seconds=self.config.claim_ttl_seconds,
-            )
-            paths_acquired = True
+            with self.control.transition_permit("claim") as admission:
+                self.journal.append("attempt.started", fact)
+                started = True
+                self.semantic_claims.acquire(
+                    owner=owner,
+                    task_id=order.task_id,
+                    targets=order.semantic_claims,
+                    ttl_seconds=self.config.claim_ttl_seconds,
+                )
+                semantic_acquired = True
+                attempt_permit = admission.issue_attempt_permit(attempt_id)
+            with self.control.transition_permit("claim", attempt_permit):
+                self.path_claims.acquire(
+                    owner=owner,
+                    task_id=work_item,
+                    targets=path_targets,
+                    ttl_seconds=self.config.claim_ttl_seconds,
+                )
+                paths_acquired = True
             with RepositoryClaimTransaction(
                 repository=self.config.repository,
                 owner=owner,
@@ -911,13 +931,15 @@ class FleetController:
                 paths=order.path_claims,
                 ttl_seconds=self.config.claim_ttl_seconds,
                 required=self.config.repository_claim_required,
+                acquire_guard=lambda: self.control.transition_permit("claim", attempt_permit),
             ) as repository_claims:
-                create_worktree(
-                    repository=self.config.repository,
-                    path=worktree,
-                    branch=branch,
-                    base_sha=order.base_sha,
-                )
+                with self.control.transition_permit("worktree", attempt_permit):
+                    create_worktree(
+                        repository=self.config.repository,
+                        path=worktree,
+                        branch=branch,
+                        base_sha=order.base_sha,
+                    )
                 prompt = self._prompt(assignment, worktree)
                 try:
                     result = self.runtime.execute(
@@ -925,6 +947,7 @@ class FleetController:
                         order=order,
                         prompt_path=prompt,
                         cwd=worktree,
+                        attempt_permit=attempt_permit,
                     )
                 except RuntimeRefusal as exc:
                     record_failure(
@@ -960,23 +983,27 @@ class FleetController:
                     raise GitRefusal("attempt produced no changed files")
 
                 def renew_claims() -> None:
-                    self.semantic_claims.renew(
-                        owner=owner,
-                        task_id=order.task_id,
-                        ttl_seconds=self.config.claim_ttl_seconds,
-                    )
-                    self.path_claims.renew(
-                        owner=owner,
-                        task_id=work_item,
-                        ttl_seconds=self.config.claim_ttl_seconds,
-                    )
+                    with self.control.transition_permit("claim", attempt_permit):
+                        self.semantic_claims.renew(
+                            owner=owner,
+                            task_id=order.task_id,
+                            ttl_seconds=self.config.claim_ttl_seconds,
+                        )
+                        self.path_claims.renew(
+                            owner=owner,
+                            task_id=work_item,
+                            ttl_seconds=self.config.claim_ttl_seconds,
+                        )
                     repository_claims.renew()
 
                 witness_rows = self._run_witnesses(
                     order,
                     worktree,
                     renew_claims=renew_claims,
+                    attempt_permit=attempt_permit,
                 )
+                with self.control.transition_permit("process", attempt_permit):
+                    pass
                 require_exact_subject(worktree, order.base_sha)
                 if not paths:
                     witness_changes = changed_paths(worktree)
@@ -988,11 +1015,12 @@ class FleetController:
                         raise ControllerError("no-change candidate stdout was truncated")
                     if not stdout_bytes:
                         raise ControllerError("no-change candidate stdout is empty")
-                    candidate_evidence = retain_candidate_evidence(
-                        state_dir=self.config.state_dir,
-                        attempt_id=attempt_id,
-                        content=stdout_bytes,
-                    )
+                    with self.control.transition_permit("process", attempt_permit):
+                        candidate_evidence = retain_candidate_evidence(
+                            state_dir=self.config.state_dir,
+                            attempt_id=attempt_id,
+                            content=stdout_bytes,
+                        )
                     if candidate_evidence["sha256"] != stdout_hash:
                         raise ControllerError("retained candidate evidence differs from executed stdout")
                     require_exact_subject(worktree, order.base_sha)
@@ -1011,7 +1039,8 @@ class FleetController:
                         "candidate_evidence": candidate_evidence,
                         "worktree_preserved": True,
                     }
-                    self.journal.append("attempt.ready", ready)
+                    with self.control.transition_permit("process", attempt_permit):
+                        self.journal.append("attempt.ready", ready)
                     return ready
                 paths = require_claimed_changes(worktree, order.path_claims)
                 commit = commit_claimed(
@@ -1020,10 +1049,14 @@ class FleetController:
                     message=f"fleet: {order.task_id} ({order.id})",
                     author_name=self.config.author_name,
                     author_email=self.config.author_email,
+                    launch_guard=lambda: self.control.transition_permit("process", attempt_permit),
                 )
                 pr_url: str | None = None
                 if order.publish_branch:
-                    publish_branch(worktree, branch)
+                    publish_branch(
+                        worktree, branch,
+                        launch_guard=lambda: self.control.transition_permit("process", attempt_permit),
+                    )
                     if order.create_draft_pr:
                         body = self._pr_body(assignment, commit, witness_rows)
                         pr_url = create_draft_pull_request(
@@ -1032,6 +1065,7 @@ class FleetController:
                             base=self.config.base_branch,
                             title=f"fleet: {order.task_id}",
                             body_path=body,
+                            launch_guard=lambda: self.control.transition_permit("process", attempt_permit),
                         )
                 ready = {
                     **fact,
@@ -1041,9 +1075,12 @@ class FleetController:
                     "pull_request_url": pr_url,
                     "worktree_preserved": True,
                 }
-                self.journal.append("attempt.ready", ready)
+                with self.control.transition_permit("process", attempt_permit):
+                    self.journal.append("attempt.ready", ready)
                 return ready
         except Exception as exc:
+            if isinstance(exc, ControlRefusal) and not started:
+                return None
             refused = {
                 **fact,
                 "error_type": type(exc).__name__,
@@ -1060,15 +1097,16 @@ class FleetController:
                 self.path_claims.release(owner=owner, task_id=work_item)
 
     def dispatch_plan(self, plan: Plan) -> tuple[Mapping[str, Any], ...]:
-        if not plan.assignments:
+        if not plan.assignments or not self.control.status().permitted:
             return ()
         if len(plan.assignments) == 1:
-            return (self.dispatch(plan.assignments[0]),)
+            result = self.dispatch(plan.assignments[0])
+            return () if result is None else (result,)
         with ThreadPoolExecutor(
             max_workers=min(len(plan.assignments), self.config.max_assignments),
             thread_name_prefix="idol-fleet",
         ) as executor:
-            return tuple(executor.map(self.dispatch, plan.assignments))
+            return tuple(result for result in executor.map(self.dispatch, plan.assignments) if result is not None)
 
     def run_once(self) -> CycleResult:
         with ControllerLease(self.lease_path):
@@ -1146,6 +1184,7 @@ class FleetController:
         }
         return {
             "mode": self.config.mode,
+            "local_control": asdict(self.control.status()),
             "repository": str(self.config.repository),
             "state_dir": str(self.config.state_dir),
             "journal_events": len(rows),
