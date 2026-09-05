@@ -13,6 +13,10 @@ This is a temporary unsupported private-API bridge for exactly `2026.8.1-beta.3`
 
 A matching version string alone is insufficient. An upgrade requires a fresh source and handler-context review, new pins, focused tests, an authenticated live observation, and renewed controller calibration. Do not discover replacement hashed aliases automatically or weaken a refusal to an idle result. These checks detect configured package drift; they are not a complete transitive dependency or malicious-root attestation.
 
+The plugin binds the configured root to the public SDK URL resolved by OpenClaw's actual loader. Each pinned source must have its canonical path inside that root. Temporary synchronous Node loader hooks verify and copy the exact bytes returned for a first module evaluation; a changed source or redirected URL refuses before evaluation. The hooks retain the original module URLs and are removed after both imports settle. Node 22.15 or later is required.
+
+The running gateway normally already owns these cached module namespaces. Reusing them preserves its canonical state. The bridge checks every exported function's body fingerprint as well as current disk bytes before and after observation, rejecting ordinary stale cached implementations. This does not retrospectively attest the cached modules' closed-over state or imported dependencies: those remain part of the trusted running gateway. Live idle and busy observations are still required before admission.
+
 ## Contract
 
 The only method is `idol.fleet.activeWork.snapshot`, accepting empty parameters. Registration preserves the SDK's default `operator.admin` scope and required authenticated profile. It does not introduce a public HTTP route or bypass gateway authentication.

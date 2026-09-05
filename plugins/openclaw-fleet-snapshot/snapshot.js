@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
+import { registerHooks } from "node:module";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -27,6 +28,10 @@ export const PINNED_OPENCLAW = Object.freeze({
   gateway: Object.freeze({
     relativePath: "dist/gateway-active-work-DHoQuaTC.js",
     sha256: "f65a34729ee974c0c4e41e1e2ca7a504aa0bf626b584a11bae5fe66f00e379a7",
+    functionSha256: Object.freeze({
+      n: "df3a825f22250ba5b5dfa477fff5a0c148f612a52af23cb3a061a8104dc2d2ec",
+      t: "f38a92c8197d90d2cfb24ab0d07d616c54513b9c67244ccff2343556e4ecef1b",
+    }),
     exportKeys: Object.freeze(["n", "t"]),
     functionExport: "t",
     functionName: "createGatewayActiveWorkSnapshot",
@@ -34,6 +39,9 @@ export const PINNED_OPENCLAW = Object.freeze({
   server: Object.freeze({
     relativePath: "dist/server-active-work-DvXAfFIM.js",
     sha256: "8f266b5bde14c43be5d1c1cd426fcff13f2280f505b53775a3152f127b633e9d",
+    functionSha256: Object.freeze({
+      t: "74fc12f3909e61259258e49d0f1ed68abbbeed1077f4fce109fbb6ff9ec39ef8",
+    }),
     exportKeys: Object.freeze(["t"]),
     functionExport: "t",
     functionName: "createGatewayServerActiveWorkInspectors",
@@ -155,6 +163,7 @@ async function verifyPinnedSource(packageRoot, descriptor) {
   }
   const sourcePath = path.resolve(packageRoot, descriptor.relativePath);
   if (!sourcePath.startsWith(`${packageRoot}${path.sep}`)) throw unsupported();
+  if (await realpath(sourcePath) !== sourcePath) throw unsupported();
   const bytes = await readStableRegularFile(sourcePath);
   if (createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256) {
     throw unsupported();
@@ -172,7 +181,9 @@ function validateModule(module, descriptor) {
     throw unsupported();
   }
   for (const key of descriptor.exportKeys) {
-    if (typeof module[key] !== "function") throw unsupported();
+    if (typeof module[key] !== "function" ||
+        createHash("sha256").update(Function.prototype.toString.call(module[key])).digest("hex") !==
+          descriptor.functionSha256?.[key]) throw unsupported();
   }
   return exported;
 }
@@ -277,12 +288,12 @@ function projectSnapshot(snapshot, openclawVersion, observedAt) {
 
 export function createFleetSnapshotObserver({
   openclawPackageRoot,
-  sdkDefinePluginEntry,
+  sdkModuleUrl,
   pinned = PINNED_OPENCLAW,
   importModule = (url) => import(url),
   now = () => new Date(),
 }) {
-  if (typeof sdkDefinePluginEntry !== "function" || !isPlainRecord(pinned)) {
+  if (typeof sdkModuleUrl !== "string" || !isPlainRecord(pinned)) {
     throw unsupported();
   }
 
@@ -290,27 +301,59 @@ export function createFleetSnapshotObserver({
 
   async function verifyInstallation() {
     const packageRoot = await verifyPackageRoot(openclawPackageRoot);
+    const sdkPath = path.join(packageRoot, "dist", "plugin-sdk", "plugin-entry.js");
+    if (fileUrl(sdkPath) !== sdkModuleUrl || await realpath(sdkPath) !== sdkPath) {
+      throw unsupported();
+    }
     await verifyPackageVersion(packageRoot, pinned.openclawVersion);
     const gatewayPath = await verifyPinnedSource(packageRoot, pinned.gateway);
     const serverPath = await verifyPinnedSource(packageRoot, pinned.server);
-    const publicSdk = await importModule(fileUrl(path.join(
-      packageRoot,
-      "dist",
-      "plugin-sdk",
-      "plugin-entry.js",
-    )));
-    if (!isRecord(publicSdk) || publicSdk.definePluginEntry !== sdkDefinePluginEntry) {
-      throw unsupported();
-    }
     return { packageRoot, gatewayPath, serverPath };
   }
 
   async function loadFunctions() {
     const verified = await verifyInstallation();
-    const [gatewayModule, serverModule] = await Promise.all([
-      importModule(fileUrl(verified.gatewayPath)),
-      importModule(fileUrl(verified.serverPath)),
+    const approved = new Map([
+      [fileUrl(verified.gatewayPath), pinned.gateway],
+      [fileUrl(verified.serverPath), pinned.server],
     ]);
+    const loaded = new Set();
+    const hooks = registerHooks({
+      resolve(specifier, context, nextResolve) {
+        const result = nextResolve(specifier, context);
+        if (approved.has(specifier) && result.url !== specifier) throw unsupported();
+        return result;
+      },
+      load(url, context, nextLoad) {
+        const result = nextLoad(url, context);
+        const descriptor = approved.get(url);
+        if (!descriptor) return result;
+        if (loaded.has(url) || result.format !== "module") throw unsupported();
+        loaded.add(url);
+        const source = result.source;
+        let bytes;
+        if (typeof source === "string") bytes = Buffer.from(source, "utf8");
+        else if (ArrayBuffer.isView(source)) {
+          bytes = Buffer.from(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
+        } else if (source instanceof ArrayBuffer) bytes = Buffer.from(new Uint8Array(source));
+        else throw unsupported();
+        if (bytes.length > MAX_PINNED_FILE_BYTES ||
+            createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256) {
+          throw unsupported();
+        }
+        return { ...result, source: bytes };
+      },
+    });
+    let modules;
+    try {
+      modules = await Promise.allSettled(
+        [...approved.keys()].map(async (url) => await importModule(url)),
+      );
+    } finally {
+      hooks.deregister();
+    }
+    if (modules.some((result) => result.status !== "fulfilled")) throw unsupported();
+    const [gatewayModule, serverModule] = modules.map((result) => result.value);
     const functions = {
       createSnapshot: validateModule(gatewayModule, pinned.gateway),
       createServerInspectors: validateModule(serverModule, pinned.server),

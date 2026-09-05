@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cp, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
+import { registerHooks } from "node:module";
 import path from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
@@ -73,6 +74,14 @@ function definePluginEntry(definition) { return definition; }
 export { definePluginEntry };
 `;
 
+function gatewayFunctionHashes(source) {
+  const split = source.indexOf("function createGatewayActiveWorkSnapshot");
+  return {
+    n: sha256(source.slice(0, split).trim()),
+    t: sha256(source.slice(split).split("\nexport {")[0].trim()),
+  };
+}
+
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -84,6 +93,10 @@ test("pins the reviewed OpenClaw version and private modules", () => {
   assert.deepEqual(PINNED_OPENCLAW.gateway, {
     relativePath: "dist/gateway-active-work-DHoQuaTC.js",
     sha256: "f65a34729ee974c0c4e41e1e2ca7a504aa0bf626b584a11bae5fe66f00e379a7",
+    functionSha256: {
+      n: "df3a825f22250ba5b5dfa477fff5a0c148f612a52af23cb3a061a8104dc2d2ec",
+      t: "f38a92c8197d90d2cfb24ab0d07d616c54513b9c67244ccff2343556e4ecef1b",
+    },
     exportKeys: ["n", "t"],
     functionExport: "t",
     functionName: "createGatewayActiveWorkSnapshot",
@@ -91,6 +104,9 @@ test("pins the reviewed OpenClaw version and private modules", () => {
   assert.deepEqual(PINNED_OPENCLAW.server, {
     relativePath: "dist/server-active-work-DvXAfFIM.js",
     sha256: "8f266b5bde14c43be5d1c1cd426fcff13f2280f505b53775a3152f127b633e9d",
+    functionSha256: {
+      t: "74fc12f3909e61259258e49d0f1ed68abbbeed1077f4fce109fbb6ff9ec39ef8",
+    },
     exportKeys: ["t"],
     functionExport: "t",
     functionName: "createGatewayServerActiveWorkInspectors",
@@ -110,15 +126,15 @@ async function makePackage(t) {
   await writeFile(path.join(root, "dist", "plugin-sdk", "plugin-entry.js"), SDK_SOURCE);
   await writeFile(path.join(root, "dist", "gateway-fixture.js"), GATEWAY_SOURCE);
   await writeFile(path.join(root, "dist", "server-fixture.js"), SERVER_SOURCE);
-  const sdk = await import(pathToFileURL(path.join(root, "dist", "plugin-sdk", "plugin-entry.js")));
   return {
     root,
-    liveDefinePluginEntry: sdk.definePluginEntry,
+    sdkModuleUrl: pathToFileURL(path.join(root, "dist", "plugin-sdk", "plugin-entry.js")).href,
     pinned: {
       openclawVersion: "fixture-version",
       gateway: {
         relativePath: "dist/gateway-fixture.js",
         sha256: sha256(GATEWAY_SOURCE),
+        functionSha256: gatewayFunctionHashes(GATEWAY_SOURCE),
         exportKeys: ["n", "t"],
         functionExport: "t",
         functionName: "createGatewayActiveWorkSnapshot",
@@ -126,6 +142,7 @@ async function makePackage(t) {
       server: {
         relativePath: "dist/server-fixture.js",
         sha256: sha256(SERVER_SOURCE),
+        functionSha256: { t: sha256(SERVER_SOURCE.trim().split("\nexport {")[0]) },
         exportKeys: ["t"],
         functionExport: "t",
         functionName: "createGatewayServerActiveWorkInspectors",
@@ -159,7 +176,7 @@ test("projects only approved metadata from one synchronous canonical composition
   const fixture = await makePackage(t);
   const observer = createFleetSnapshotObserver({
     openclawPackageRoot: fixture.root,
-    sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+    sdkModuleUrl: fixture.sdkModuleUrl,
     pinned: fixture.pinned,
     now: () => new Date("2026-09-05T04:00:00.000Z"),
   });
@@ -195,9 +212,10 @@ test("an idle canonical snapshot remains idle", async (t) => {
     .replace("rootRequests: 1", "rootRequests: 0");
   await writeFile(gatewayPath, idleSource);
   fixture.pinned.gateway.sha256 = sha256(idleSource);
+  fixture.pinned.gateway.functionSha256 = gatewayFunctionHashes(idleSource);
   const observer = createFleetSnapshotObserver({
     openclawPackageRoot: fixture.root,
-    sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+    sdkModuleUrl: fixture.sdkModuleUrl,
     pinned: fixture.pinned,
   });
   const liveContext = context();
@@ -211,11 +229,11 @@ test("an idle canonical snapshot remains idle", async (t) => {
   assert.equal(result.counts.totalActive, 0);
 });
 
-test("binds the configured root to the public SDK function identity", async (t) => {
+test("binds the configured root to the loader-resolved public SDK URL", async (t) => {
   const fixture = await makePackage(t);
   const observer = createFleetSnapshotObserver({
     openclawPackageRoot: fixture.root,
-    sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+    sdkModuleUrl: fixture.sdkModuleUrl,
     pinned: fixture.pinned,
   });
   await observer(context());
@@ -225,19 +243,126 @@ test("binds the configured root to the public SDK function identity", async (t) 
     await import("node:fs/promises").then(({ rm }) => rm(copy, { recursive: true, force: true }));
   });
   await cp(fixture.root, copy, { recursive: true });
+  await writeFile(path.join(copy, "dist", "plugin-sdk", "plugin-entry.js"),
+    "globalThis.unverifiedSdkExecuted = true;\n" + SDK_SOURCE);
   const duplicateObserver = createFleetSnapshotObserver({
     openclawPackageRoot: copy,
-    sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+    sdkModuleUrl: fixture.sdkModuleUrl,
     pinned: fixture.pinned,
   });
   await assert.rejects(duplicateObserver(context()), /unsupported OpenClaw internal bridge/);
+  assert.equal(globalThis.unverifiedSdkExecuted, undefined);
+});
+
+test("rejects replacement bytes before evaluation and removes temporary hooks", async (t) => {
+  for (const target of ["gateway", "server"]) {
+    await t.test(target, async (t) => {
+      const fixture = await makePackage(t);
+      const targetPath = path.join(fixture.root, fixture.pinned[target].relativePath);
+      const targetUrl = pathToFileURL(targetPath).href;
+      const other = target === "gateway" ? "server" : "gateway";
+      const otherUrl = pathToFileURL(path.join(fixture.root, fixture.pinned[other].relativePath)).href;
+      const observer = createFleetSnapshotObserver({
+        openclawPackageRoot: fixture.root,
+        sdkModuleUrl: fixture.sdkModuleUrl,
+        pinned: fixture.pinned,
+        importModule: async (url) => {
+          if (url === otherUrl) return {};
+          assert.equal(url, targetUrl);
+          await writeFile(targetPath, "globalThis.unverifiedBridgeExecuted = true;\n");
+          return await import(url);
+        },
+      });
+      await assert.rejects(observer(context()), /unsupported OpenClaw internal bridge/);
+      assert.equal(globalThis.unverifiedBridgeExecuted, undefined);
+      // An ordinary import after refusal is no longer intercepted by the bridge.
+      await writeFile(path.join(fixture.root, fixture.pinned[other].relativePath), "export const probe = 1;\n");
+      assert.equal((await import(otherUrl)).probe, 1);
+    });
+  }
+});
+
+test("retains canonical cached modules and refuses stale cached function bodies", async (t) => {
+  const fixture = await makePackage(t);
+  const gatewayPath = path.join(fixture.root, fixture.pinned.gateway.relativePath);
+  const gatewayUrl = pathToFileURL(gatewayPath).href;
+  const canonical = await import(gatewayUrl);
+  let sawCanonical = false;
+  const observer = createFleetSnapshotObserver({
+    openclawPackageRoot: fixture.root,
+    sdkModuleUrl: fixture.sdkModuleUrl,
+    pinned: fixture.pinned,
+    importModule: async (url) => {
+      const module = await import(url);
+      if (url === gatewayUrl) {
+        assert.strictEqual(module, canonical);
+        sawCanonical = true;
+      }
+      return module;
+    },
+  });
+  assert.equal((await observer(context())).counts.totalActive, 12);
+  assert.equal(sawCanonical, true);
+
+  const stale = await makePackage(t);
+  const stalePath = path.join(stale.root, stale.pinned.gateway.relativePath);
+  await writeFile(stalePath, GATEWAY_SOURCE.replace("queueSize: 2", "queueSize: 0"));
+  await import(pathToFileURL(stalePath).href);
+  await writeFile(stalePath, GATEWAY_SOURCE);
+  const staleObserver = createFleetSnapshotObserver({
+    openclawPackageRoot: stale.root,
+    sdkModuleUrl: stale.sdkModuleUrl,
+    pinned: stale.pinned,
+  });
+  await assert.rejects(staleObserver(context()), /unsupported OpenClaw internal bridge/);
+});
+
+test("refuses redirected canonical URLs before evaluation", async (t) => {
+  const fixture = await makePackage(t);
+  const gatewayUrl = pathToFileURL(path.join(fixture.root, fixture.pinned.gateway.relativePath)).href;
+  const redirectedPath = path.join(fixture.root, "redirected.js");
+  await writeFile(redirectedPath, "globalThis.redirectedBridgeExecuted = true;\n");
+  const redirect = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === gatewayUrl) {
+        return nextResolve(pathToFileURL(redirectedPath).href, context);
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  try {
+    const observer = createFleetSnapshotObserver({
+      openclawPackageRoot: fixture.root,
+      sdkModuleUrl: fixture.sdkModuleUrl,
+      pinned: fixture.pinned,
+    });
+    await assert.rejects(observer(context()), /unsupported OpenClaw internal bridge/);
+    assert.equal(globalThis.redirectedBridgeExecuted, undefined);
+  } finally {
+    redirect.deregister();
+  }
+});
+
+test("refuses a symlinked ancestor of pinned sources", async (t) => {
+  const fixture = await makePackage(t);
+  const dist = path.join(fixture.root, "dist");
+  const redirected = path.join(fixture.root, "redirected-dist");
+  await cp(dist, redirected, { recursive: true });
+  await rm(dist, { recursive: true });
+  await symlink(redirected, dist);
+  const observer = createFleetSnapshotObserver({
+    openclawPackageRoot: fixture.root,
+    sdkModuleUrl: fixture.sdkModuleUrl,
+    pinned: fixture.pinned,
+  });
+  await assert.rejects(observer(context()), /unsupported OpenClaw internal bridge/);
 });
 
 test("refuses source drift after a successful observation", async (t) => {
   const fixture = await makePackage(t);
   const observer = createFleetSnapshotObserver({
     openclawPackageRoot: fixture.root,
-    sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+    sdkModuleUrl: fixture.sdkModuleUrl,
     pinned: fixture.pinned,
   });
   await observer(context());
@@ -256,7 +381,7 @@ test("refuses package-version and private-export drift", async (t) => {
   );
   const wrongVersion = createFleetSnapshotObserver({
     openclawPackageRoot: versionFixture.root,
-    sdkDefinePluginEntry: versionFixture.liveDefinePluginEntry,
+    sdkModuleUrl: versionFixture.sdkModuleUrl,
     pinned: versionFixture.pinned,
   });
   await assert.rejects(wrongVersion(context()), /unsupported OpenClaw internal bridge/);
@@ -268,7 +393,7 @@ test("refuses package-version and private-export drift", async (t) => {
   const realGateway = await import(gatewayUrl);
   const extraExport = createFleetSnapshotObserver({
     openclawPackageRoot: exportFixture.root,
-    sdkDefinePluginEntry: exportFixture.liveDefinePluginEntry,
+    sdkModuleUrl: exportFixture.sdkModuleUrl,
     pinned: exportFixture.pinned,
     importModule: async (url) => {
       if (url === gatewayUrl) return { ...realGateway, unexpected: () => {} };
@@ -283,7 +408,7 @@ test("refuses a replaced FIFO without blocking", { timeout: 2_000 }, async (t) =
   const fixture = await makePackage(t);
   const observer = createFleetSnapshotObserver({
     openclawPackageRoot: fixture.root,
-    sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+    sdkModuleUrl: fixture.sdkModuleUrl,
     pinned: fixture.pinned,
   });
   await observer(context());
@@ -297,7 +422,7 @@ test("refuses malformed handler context before private composition", async (t) =
   const fixture = await makePackage(t);
   const observer = createFleetSnapshotObserver({
     openclawPackageRoot: fixture.root,
-    sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+    sdkModuleUrl: fixture.sdkModuleUrl,
     pinned: fixture.pinned,
   });
   const invalidContexts = [
@@ -346,17 +471,17 @@ test("refuses malformed canonical counter projections", async (t) => {
   ];
 
   for (const snapshot of malformed) {
+    const aggregate = function createGatewayActiveWorkSnapshot() { return snapshot; };
+    fixture.pinned.gateway.functionSha256.t = sha256(aggregate.toString());
     const observer = createFleetSnapshotObserver({
       openclawPackageRoot: fixture.root,
-      sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+      sdkModuleUrl: fixture.sdkModuleUrl,
       pinned: fixture.pinned,
       importModule: async (url) => {
         if (url === gatewayUrl) {
           return {
             n: realGateway.n,
-            t: function createGatewayActiveWorkSnapshot() {
-              return snapshot;
-            },
+            t: aggregate,
           };
         }
         if (url === serverUrl) return realServer;
@@ -407,9 +532,10 @@ test("refuses swallowed inspector failures and incomplete sampling", async (t) =
   ];
 
   for (const [index, aggregate] of aggregators.entries()) {
+    fixture.pinned.gateway.functionSha256.t = sha256(aggregate.toString());
     const observer = createFleetSnapshotObserver({
       openclawPackageRoot: fixture.root,
-      sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+      sdkModuleUrl: fixture.sdkModuleUrl,
       pinned: fixture.pinned,
       importModule: async (url) => {
         if (url === gatewayUrl) return { n: realGateway.n, t: aggregate };
@@ -435,7 +561,7 @@ test("registers with default admin and profile authorization", async (t) => {
       },
     },
     {
-      sdkDefinePluginEntry: fixture.liveDefinePluginEntry,
+      sdkModuleUrl: fixture.sdkModuleUrl,
       pinned: fixture.pinned,
       now: () => new Date("2026-09-05T04:00:00.000Z"),
     },
@@ -467,7 +593,7 @@ test("returns generic errors without private content", async (t) => {
         registrations.push(args);
       },
     },
-    { sdkDefinePluginEntry: fixture.liveDefinePluginEntry, pinned: fixture.pinned },
+    { sdkModuleUrl: fixture.sdkModuleUrl, pinned: fixture.pinned },
   );
   const handler = registrations[0][1];
 

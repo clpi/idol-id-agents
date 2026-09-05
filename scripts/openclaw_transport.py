@@ -55,6 +55,10 @@ def _listener_rows(proc_root: Path, port: int) -> tuple[LoopbackEndpoint, ...]:
     for table, family, expected_address, address in tables:
         try:
             lines = (proc_root / "net" / table).read_text(encoding="utf-8").splitlines()[1:]
+        except FileNotFoundError as exc:
+            if table == "tcp6":
+                continue
+            raise TransportRefusal("OpenClaw listener table is unavailable") from exc
         except OSError as exc:
             raise TransportRefusal("OpenClaw listener table is unavailable") from exc
         for line in lines:

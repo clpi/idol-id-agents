@@ -186,7 +186,21 @@ class OpenClawTransportTests(unittest.TestCase):
                 with self.assertRaises(transport.TransportRefusal):
                     transport.observe_local_gateway(proc_root=proc)
 
-    def test_missing_or_unreadable_listener_table_is_refused(self) -> None:
+    def test_missing_ipv6_table_is_an_optional_empty_family(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = self.fixture(Path(temporary), ipv6=False)
+            (proc / "net" / "tcp6").unlink()
+            observed = transport.observe_local_gateway(proc_root=proc)
+        self.assertEqual(tuple(endpoint.family for endpoint in observed.endpoints), ("ipv4",))
+
+    def test_missing_ipv4_listener_table_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = self.fixture(Path(temporary), ipv6=False)
+            (proc / "net" / "tcp").unlink()
+            with self.assertRaisesRegex(transport.TransportRefusal, "unavailable"):
+                transport.observe_local_gateway(proc_root=proc)
+
+    def test_empty_listener_table_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             proc = Path(temporary) / "proc"
             (proc / "net").mkdir(parents=True)
