@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from .evidence import EvidenceArtifactError, validate_candidate_evidence
 from .journal import Journal
 
 
@@ -28,12 +29,16 @@ class OutcomeReceipt:
     defects: int
     observed_at: float
     evidence: str
+    candidate_evidence_sha256: str | None = None
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "OutcomeReceipt":
         reviewers = raw.get("reviewer_families")
         if isinstance(reviewers, (str, bytes)) or not isinstance(reviewers, Sequence):
             raise OutcomeRefusal("reviewer_families must be an array")
+        accepted_commit = raw.get("accepted_commit")
+        if accepted_commit is not None and not isinstance(accepted_commit, str):
+            raise OutcomeRefusal("accepted_commit must be a string or null")
         receipt = cls(
             schema=str(raw.get("schema", "")),
             attempt_id=str(raw.get("attempt_id", "")).strip(),
@@ -41,13 +46,18 @@ class OutcomeReceipt:
             task_id=str(raw.get("task_id", "")).strip(),
             route_id=str(raw.get("route_id", "")).strip(),
             verdict=str(raw.get("verdict", "")).strip().lower(),
-            accepted_commit=str(raw.get("accepted_commit", "")).strip() or None,
+            accepted_commit=(
+                accepted_commit.strip() or None
+                if accepted_commit is not None
+                else None
+            ),
             reviewer_families=tuple(reviewers),
             semantic_increment=float(raw.get("semantic_increment", 0)),
             accepted_tokens=int(raw.get("accepted_tokens", 0)),
             defects=int(raw.get("defects", 0)),
             observed_at=float(raw.get("observed_at", 0)),
             evidence=str(raw.get("evidence", "")).strip(),
+            candidate_evidence_sha256=raw.get("candidate_evidence_sha256"),
         )
         _validate_receipt(receipt)
         return receipt
@@ -68,6 +78,13 @@ def _validate_receipt(receipt: OutcomeReceipt) -> None:
         raise OutcomeRefusal("observed_at must be finite")
     if receipt.accepted_tokens < 0 or receipt.defects < 0:
         raise OutcomeRefusal("outcome tokens/defects cannot be negative")
+    candidate_hash = receipt.candidate_evidence_sha256
+    if candidate_hash is not None and (
+        not isinstance(candidate_hash, str)
+        or len(candidate_hash) != 64
+        or any(character not in "0123456789abcdef" for character in candidate_hash)
+    ):
+        raise OutcomeRefusal("candidate evidence hash must be lowercase SHA-256")
     if isinstance(receipt.reviewer_families, (str, bytes)) or not isinstance(
         receipt.reviewer_families, Sequence
     ):
@@ -105,6 +122,7 @@ def record_outcome(
     _validate_receipt(receipt)
     attempt: Mapping[str, Any] | None = None
     ready: Mapping[str, Any] | None = None
+    executed: Mapping[str, Any] | None = None
     implementer_family: str | None = None
     existing_verdict: str | None = None
     for row in journal.events():
@@ -118,6 +136,7 @@ def record_outcome(
         if row.get("kind") == "attempt.ready":
             ready = fact
         if row.get("kind") == "attempt.executed":
+            executed = fact
             implementer_family = str(fact.get("provider_family") or "") or None
         if row.get("kind") in {"attempt.admitted", "attempt.rejected", "attempt.reverted"}:
             existing_verdict = str(row.get("kind")).split(".")[-1]
@@ -134,6 +153,43 @@ def record_outcome(
         raise OutcomeRefusal(f"attempt already has terminal outcome {existing_verdict}")
     if ready is None:
         raise OutcomeRefusal("outcome references an attempt that is not ready")
+    no_change = "no_change" in ready
+    if no_change and ready.get("no_change") is not True:
+        raise OutcomeRefusal("no-change readiness marker is invalid")
+    if no_change:
+        base_sha = attempt.get("base_sha")
+        if (
+            not isinstance(base_sha, str)
+            or len(base_sha) != 40
+            or any(character not in "0123456789abcdef" for character in base_sha)
+            or ready.get("base_sha") != base_sha
+            or ready.get("commit") != base_sha
+        ):
+            raise OutcomeRefusal("no-change outcome does not match the exact base subject")
+        if receipt.verdict == "admitted":
+            if receipt.accepted_commit != base_sha:
+                raise OutcomeRefusal("admitted no-change outcome lacks the base subject")
+        elif receipt.accepted_commit is not None:
+            raise OutcomeRefusal("non-admitted no-change outcome claims an accepted commit")
+        if ready.get("paths") not in ((), []):
+            raise OutcomeRefusal("no-change readiness contains source paths")
+        if receipt.candidate_evidence_sha256 is None:
+            raise OutcomeRefusal("no-change outcome lacks candidate evidence binding")
+        try:
+            candidate_evidence = validate_candidate_evidence(
+                ready.get("candidate_evidence"),
+                state_dir=journal.path.parent,
+                attempt_id=receipt.attempt_id,
+            )
+        except EvidenceArtifactError as exc:
+            raise OutcomeRefusal("candidate evidence is unavailable or invalid") from exc
+        if candidate_evidence["sha256"] != receipt.candidate_evidence_sha256:
+            raise OutcomeRefusal("candidate evidence hash does not match the reviewed outcome")
+        if executed is None or executed.get("stdout_hash") != candidate_evidence["sha256"]:
+            raise OutcomeRefusal("candidate evidence does not match the executed output")
+    else:
+        if "candidate_evidence" in ready or receipt.candidate_evidence_sha256 is not None:
+            raise OutcomeRefusal("source-change outcome contains unexplained candidate evidence")
     if receipt.verdict == "admitted" and ready.get("commit") != receipt.accepted_commit:
         raise OutcomeRefusal("accepted commit does not match the ready candidate")
     configured_family = (route_families or {}).get(receipt.route_id)
@@ -155,6 +211,9 @@ def record_outcome(
         "defects": receipt.defects,
         "evidence": receipt.evidence,
     }
+    if no_change:
+        fact["no_change"] = True
+        fact["candidate_evidence_sha256"] = receipt.candidate_evidence_sha256
     return journal.append(f"attempt.{receipt.verdict}", fact, at=receipt.observed_at)
 
 

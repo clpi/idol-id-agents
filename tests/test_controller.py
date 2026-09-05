@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -11,9 +13,11 @@ from unittest import mock
 
 from fleet_control.calibration import calibrate
 from fleet_control.controller import ControllerError, FleetController, load_config
+from fleet_control.evidence import retain_candidate_evidence
 from fleet_control.gitops import GitRefusal, current_sha
 from fleet_control.health import record_failure
 from fleet_control.model import stable_hash
+from fleet_control.runtime import RunResult
 
 
 class ControllerTests(unittest.TestCase):
@@ -171,6 +175,27 @@ class ControllerTests(unittest.TestCase):
         self.git(writer, "config", "user.name", "remote-test")
         self.git(writer, "config", "user.email", "remote@example.com")
         return writer
+
+    def enable_no_change_order(
+        self,
+        *,
+        state: Path,
+        config_path: Path,
+        witnesses: list[list[str]] | None = None,
+    ) -> None:
+        config = json.loads(config_path.read_text())
+        config["routes"][0]["roles"].append("evidence")
+        config_path.write_text(json.dumps(config))
+        order_path = state / "work-orders/t_controller_1.json"
+        order = json.loads(order_path.read_text())
+        order["role"] = "evidence"
+        order["required_outcome"] = "Prove whether the exact subject already satisfies the bounded claim."
+        order["allow_no_change"] = True
+        if witnesses is not None:
+            order["witnesses"] = witnesses
+        order_path.write_text(json.dumps(order))
+        raw, parsed = load_config(config_path)
+        calibrate(raw_config=raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
 
     def enable_remote_tracking(self, config_path: Path, *, auto_fast_forward: bool) -> None:
         raw = json.loads(config_path.read_text())
@@ -416,31 +441,39 @@ class ControllerTests(unittest.TestCase):
         with temporary:
             agent.write_text(
                 "import json\n"
-                "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'usage':{'tokens':1}}))\n"
+                "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'candidate':'PRIVATE NO CHANGE EVIDENCE','usage':{'tokens':1}}))\n"
             )
-            config = json.loads(config_path.read_text())
-            config["routes"][0]["roles"].append("evidence")
-            config_path.write_text(json.dumps(config))
-            order_path = state / "work-orders/t_controller_1.json"
-            order = json.loads(order_path.read_text())
-            order["role"] = "evidence"
-            order["required_outcome"] = "Prove whether the exact subject already satisfies the bounded claim."
-            order["allow_no_change"] = True
-            order["witnesses"] = [
-                ["python3", "-c", "from pathlib import Path; assert Path('src/ok.txt').read_text() == 'base\\n'"]
-            ]
-            order_path.write_text(json.dumps(order))
-            raw, parsed = load_config(config_path)
-            calibrate(raw_config=raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
+            self.enable_no_change_order(
+                state=state,
+                config_path=config_path,
+                witnesses=[
+                    ["python3", "-c", "from pathlib import Path; assert Path('src/ok.txt').read_text() == 'base\\n'"]
+                ],
+            )
             old = os.environ.get("IDOL_TEST_CLAIM_LOG")
             os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
             try:
                 controller = FleetController(config_path=config_path)
                 result = controller.run_once()
                 self.assertEqual(len(result.attempts), 1)
-                self.assertEqual(result.attempts[0]["paths"], ())
-                self.assertNotIn("commit", result.attempts[0])
-                self.assertEqual(controller.journal.verify()[-2]["kind"], "attempt.no-change")
+                ready = result.attempts[0]
+                self.assertEqual(ready["paths"], ())
+                self.assertEqual(ready["commit"], ready["base_sha"])
+                self.assertTrue(ready["no_change"])
+                artifact = ready["candidate_evidence"]
+                self.assertEqual(set(artifact), {"path", "sha256", "size_bytes"})
+                evidence_path = Path(artifact["path"])
+                evidence = evidence_path.read_bytes()
+                self.assertIn(b"PRIVATE NO CHANGE EVIDENCE", evidence)
+                self.assertEqual(hashlib.sha256(evidence).hexdigest(), artifact["sha256"])
+                self.assertEqual(len(evidence), artifact["size_bytes"])
+                self.assertEqual(stat.S_IMODE(evidence_path.parent.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(evidence_path.stat().st_mode), 0o600)
+                events = controller.journal.verify()
+                self.assertEqual(events[-2]["kind"], "attempt.ready")
+                executed = next(row["fact"] for row in events if row["kind"] == "attempt.executed")
+                self.assertEqual(executed["stdout_hash"], artifact["sha256"])
+                self.assertNotIn("PRIVATE NO CHANGE EVIDENCE", controller.journal.path.read_text())
                 self.assertFalse(controller.run_once().attempts)
             finally:
                 if old is None:
@@ -479,16 +512,7 @@ class ControllerTests(unittest.TestCase):
                 "subprocess.run(['git','-c','user.name=test','-c','user.email=test@example.com','commit','-m','agent commit'],cwd=cwd,check=True)\n"
                 "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'usage':{'tokens':1}}))\n"
             )
-            config = json.loads(config_path.read_text())
-            config["routes"][0]["roles"].append("evidence")
-            config_path.write_text(json.dumps(config))
-            order_path = state / "work-orders/t_controller_1.json"
-            order = json.loads(order_path.read_text())
-            order["role"] = "evidence"
-            order["allow_no_change"] = True
-            order_path.write_text(json.dumps(order))
-            raw, parsed = load_config(config_path)
-            calibrate(raw_config=raw, routes=parsed.routes, output=parsed.calibration_file, ttl_seconds=600)
+            self.enable_no_change_order(state=state, config_path=config_path)
             old = os.environ.get("IDOL_TEST_CLAIM_LOG")
             os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
             try:
@@ -496,6 +520,102 @@ class ControllerTests(unittest.TestCase):
                 result = controller.run_once()
                 self.assertIn("stale work order", result.attempts[0]["error"])
                 self.assertEqual(controller.journal.verify()[-2]["kind"], "attempt.refused")
+            finally:
+                if old is None:
+                    os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+                else:
+                    os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_no_change_refuses_truncated_stdout(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            agent.write_text(
+                "import json\n"
+                "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'candidate':'x'*2000001,'usage':{'tokens':1}}))\n"
+            )
+            self.enable_no_change_order(
+                state=state,
+                config_path=config_path,
+                witnesses=[["python3", "-c", "from pathlib import Path; assert Path('src/ok.txt').read_text() == 'base\\n'"]],
+            )
+            old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+            os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+            try:
+                result = FleetController(config_path=config_path).run_once()
+                self.assertEqual(result.attempts[0]["error"], "no-change candidate stdout was truncated")
+                self.assertFalse((state / "candidate-evidence").exists())
+            finally:
+                if old is None:
+                    os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+                else:
+                    os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_no_change_refuses_empty_stdout(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            self.enable_no_change_order(
+                state=state,
+                config_path=config_path,
+                witnesses=[["python3", "-c", "from pathlib import Path; assert Path('src/ok.txt').read_text() == 'base\\n'"]],
+            )
+            controller = FleetController(config_path=config_path)
+            empty_result = RunResult(
+                route_id="local-test",
+                provider="local",
+                model="test-model",
+                status="ok",
+                returncode=0,
+                started_at=1,
+                ended_at=2,
+                stdout="",
+                stdout_truncated=False,
+                stderr="",
+                usage={"tokens": 1},
+                cost_usd=0.0,
+                session_id=None,
+            )
+            old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+            os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+            try:
+                with mock.patch.object(controller.runtime, "execute", return_value=empty_result):
+                    result = controller.run_once()
+                self.assertEqual(result.attempts[0]["error"], "no-change candidate stdout is empty")
+                self.assertFalse((state / "candidate-evidence").exists())
+            finally:
+                if old is None:
+                    os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
+                else:
+                    os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_no_change_rechecks_worktree_after_retaining_evidence(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")
+        with temporary:
+            agent.write_text(
+                "import json\n"
+                "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,'usage':{'tokens':1}}))\n"
+            )
+            self.enable_no_change_order(
+                state=state,
+                config_path=config_path,
+                witnesses=[["python3", "-c", "from pathlib import Path; assert Path('src/ok.txt').read_text() == 'base\\n'"]],
+            )
+
+            def retain_then_mutate(**arguments):
+                descriptor = retain_candidate_evidence(**arguments)
+                worktree = next((state / "worktrees").iterdir())
+                (worktree / "src/ok.txt").write_text("late mutation\n")
+                return descriptor
+
+            old = os.environ.get("IDOL_TEST_CLAIM_LOG")
+            os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
+            try:
+                with mock.patch(
+                    "fleet_control.controller.retain_candidate_evidence",
+                    side_effect=retain_then_mutate,
+                ):
+                    result = FleetController(config_path=config_path).run_once()
+                self.assertIn("no-change worktree mutated before readiness", result.attempts[0]["error"])
+                self.assertEqual(result.attempts[0]["error_type"], "GitRefusal")
             finally:
                 if old is None:
                     os.environ.pop("IDOL_TEST_CLAIM_LOG", None)

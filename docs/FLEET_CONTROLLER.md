@@ -26,7 +26,7 @@ LIVE owns actors, tasks, attempts, claims, routes, allowance observations, witne
 - **Two claim layers.** Every repository path enters the controller’s private hierarchical path store; IDOL additionally uses its repository-owned positional `tools/node/dev/claim` authority. Semantic boundaries use a separate private hierarchical store. Any conflict blocks dispatch. A repository without an executable claim adapter, such as today’s early LIVE source tree, must opt into the private path store explicitly with `repository_claim_required: false`.
 - **No shell-shaped work orders.** Runtime commands and witness commands are argument vectors. The controller never evaluates work-order text through a shell.
 - **Containment is measured after execution.** Any edit outside the claimed paths holds the attempt and preserves the worktree. A successful process is not successful work.
-- **No-change is evidence, never an implementation escape hatch.** Only an explicit `allow_no_change` order in an evidence-producing role may terminate without a repository delta, and only after exact-HEAD checks bracket every bound witness on the exact subject. Implementation and mechanical orders still refuse empty work.
+- **No-change is reviewable evidence, never an implementation escape hatch.** Only an explicit `allow_no_change` order in an evidence-producing role may proceed without a repository delta, and only after exact-HEAD checks bracket every bound witness on the exact subject. Its bounded, nonempty runtime output is retained privately and the unchanged base enters the ordinary `attempt.ready` review lifecycle. Implementation and mechanical orders still refuse empty work.
 - **Evidence precedes review; review precedes admission.** The controller can create a draft branch/PR handoff, but never merges or admits its own attempt.
 - **Uncertainty preserves evidence.** Failed, stale, conflicted, timed-out, or ambiguous attempts retain their worktrees and journal entries. Cleanup is an explicit later operation.
 - **No automatic reset redemption or top-up.** Banked resets, extra usage, credits, and purchases require a separate human-authorized operation outside the controller.
@@ -45,6 +45,8 @@ Each cycle:
 8. leave acceptance to an independent reviewer and IDOL’s normal admission gates.
 
 Runtime refusals open a per-route circuit for 5 minutes, then 15 minutes, then 1 hour, capped at 6 hours. A successful bounded run resets that circuit. Exhausted allowance disables only that route, so the same immutable work order remains eligible for another calibrated provider on the next cycle. Reviewed outcomes feed a bounded productivity factor into routing; unreviewed token volume never counts as progress.
+
+Allowed no-change evidence is reviewable only when its stdout is complete and nonempty. The controller stores the exact bounded bytes in a mode-0600 file beneath a mode-0700 `candidate-evidence` state directory, then journals only `{path, sha256, size_bytes}`. The ready fact sets `no_change: true`, uses the exact base SHA as its candidate commit, and keeps `paths` empty. Outcome recording reopens the artifact without following its final path, validates its private mode, owner, stable file identity, digest, and size, and binds every terminal verdict to that digest. This protects against ordinary drift; it is not an attestation against malicious root replacement.
 
 Assignments with disjoint path and semantic claims execute concurrently up to `max_assignments`. Claiming, journal writes, and worktree creation remain serialized by their own locks.
 

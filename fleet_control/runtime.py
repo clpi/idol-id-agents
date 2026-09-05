@@ -28,6 +28,7 @@ class RunResult:
     started_at: float
     ended_at: float
     stdout: str
+    stdout_truncated: bool
     stderr: str
     usage: Mapping[str, Any]
     cost_usd: float | None
@@ -85,10 +86,10 @@ class CommandRuntime:
         process.wait(timeout=8)
 
     @staticmethod
-    def _bounded_text(value: str, limit: int = 2_000_000) -> str:
+    def _bounded_text(value: str, limit: int = 2_000_000) -> tuple[str, bool]:
         if len(value) <= limit:
-            return value
-        return value[:limit] + "\n[controller-output-truncated]\n"
+            return value, False
+        return value[:limit] + "\n[controller-output-truncated]\n", True
 
     @staticmethod
     def _json_object(text: str) -> Mapping[str, Any]:
@@ -139,6 +140,8 @@ class CommandRuntime:
             raise RuntimeRefusal(f"model mismatch: expected {route.model!r}, observed {model!r}")
         if route.billing is BillingClass.LOCAL and cost not in {None, 0.0}:
             raise RuntimeRefusal("local route reported positive model cost")
+        bounded_stdout, stdout_truncated = self._bounded_text(stdout)
+        bounded_stderr, _ = self._bounded_text(stderr)
         return RunResult(
             route_id=route.id,
             provider=provider,
@@ -147,8 +150,9 @@ class CommandRuntime:
             returncode=returncode,
             started_at=started_at,
             ended_at=ended_at,
-            stdout=self._bounded_text(stdout),
-            stderr=self._bounded_text(stderr),
+            stdout=bounded_stdout,
+            stdout_truncated=stdout_truncated,
+            stderr=bounded_stderr,
             usage=dict(usage),
             cost_usd=cost,
             session_id=str(session) if session else None,
@@ -177,6 +181,8 @@ class CommandRuntime:
         cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
         if route.billing is BillingClass.LOCAL and cost not in {None, 0.0}:
             raise RuntimeRefusal("local route reported positive model cost")
+        bounded_stdout, stdout_truncated = self._bounded_text(stdout)
+        bounded_stderr, _ = self._bounded_text(stderr)
         return RunResult(
             route_id=route.id,
             provider=provider,
@@ -185,8 +191,9 @@ class CommandRuntime:
             returncode=returncode,
             started_at=started_at,
             ended_at=ended_at,
-            stdout=self._bounded_text(stdout),
-            stderr=self._bounded_text(stderr),
+            stdout=bounded_stdout,
+            stdout_truncated=stdout_truncated,
+            stderr=bounded_stderr,
             usage=dict(usage),
             cost_usd=cost,
             session_id=str(payload.get("sessionId")) if payload.get("sessionId") else None,
@@ -218,6 +225,8 @@ class CommandRuntime:
         cost = float(raw_cost) if isinstance(raw_cost, (int, float)) else None
         if route.billing is BillingClass.LOCAL and cost not in {None, 0.0}:
             raise RuntimeRefusal("local Hermes route reported positive model cost")
+        bounded_stdout, stdout_truncated = self._bounded_text(stdout)
+        bounded_stderr, _ = self._bounded_text(stderr)
         return RunResult(
             route_id=route.id,
             provider=provider,
@@ -226,8 +235,9 @@ class CommandRuntime:
             returncode=returncode,
             started_at=started_at,
             ended_at=ended_at,
-            stdout=self._bounded_text(stdout),
-            stderr=self._bounded_text(stderr),
+            stdout=bounded_stdout,
+            stdout_truncated=stdout_truncated,
+            stderr=bounded_stderr,
             usage=dict(payload),
             cost_usd=cost,
             session_id=str(payload.get("session_id")) if payload.get("session_id") else None,

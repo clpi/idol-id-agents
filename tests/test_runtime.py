@@ -75,6 +75,12 @@ class RuntimeTests(unittest.TestCase):
             result = runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository)
             self.assertEqual(result.model, "test-model")
             self.assertEqual(result.cost_usd, 0.0)
+            self.assertFalse(result.stdout_truncated)
+
+    def test_stdout_truncation_is_explicit(self) -> None:
+        bounded, truncated = CommandRuntime._bounded_text("abcd", limit=3)
+        self.assertEqual(bounded, "abc\n[controller-output-truncated]\n")
+        self.assertTrue(truncated)
 
     def test_provider_mismatch_refuses(self) -> None:
         temporary, runtime, route, order, prompt = self.execute_script(

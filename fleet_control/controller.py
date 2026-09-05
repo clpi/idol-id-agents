@@ -20,6 +20,7 @@ from .calibration import (
     require_current_route_proof,
 )
 from .claims import ControllerLease, RepositoryClaimTransaction, SemanticClaimStore
+from .evidence import retain_candidate_evidence
 from .gitops import (
     GitRefusal,
     changed_paths,
@@ -934,6 +935,8 @@ class FleetController:
                     )
                     raise
                 record_success(self.journal, route)
+                stdout_bytes = result.stdout.encode("utf-8")
+                stdout_hash = hashlib.sha256(stdout_bytes).hexdigest()
                 self.journal.append(
                     "attempt.executed",
                     {
@@ -945,7 +948,7 @@ class FleetController:
                         "session_id": result.session_id,
                         "usage": dict(result.usage),
                         "cost_usd": result.cost_usd,
-                        "stdout_hash": hashlib.sha256(result.stdout.encode()).hexdigest(),
+                        "stdout_hash": stdout_hash,
                         "stderr_hash": hashlib.sha256(result.stderr.encode()).hexdigest(),
                     },
                 )
@@ -981,14 +984,35 @@ class FleetController:
                         raise GitRefusal(
                             "witness mutated a no-change worktree: " + ", ".join(witness_changes)
                         )
-                    no_change = {
+                    if result.stdout_truncated:
+                        raise ControllerError("no-change candidate stdout was truncated")
+                    if not stdout_bytes:
+                        raise ControllerError("no-change candidate stdout is empty")
+                    candidate_evidence = retain_candidate_evidence(
+                        state_dir=self.config.state_dir,
+                        attempt_id=attempt_id,
+                        content=stdout_bytes,
+                    )
+                    if candidate_evidence["sha256"] != stdout_hash:
+                        raise ControllerError("retained candidate evidence differs from executed stdout")
+                    require_exact_subject(worktree, order.base_sha)
+                    final_changes = changed_paths(worktree)
+                    if final_changes:
+                        raise GitRefusal(
+                            "no-change worktree mutated before readiness: " + ", ".join(final_changes)
+                        )
+                    ready = {
                         **fact,
+                        "commit": order.base_sha,
                         "paths": (),
                         "witnesses": witness_rows,
+                        "pull_request_url": None,
+                        "no_change": True,
+                        "candidate_evidence": candidate_evidence,
                         "worktree_preserved": True,
                     }
-                    self.journal.append("attempt.no-change", no_change)
-                    return no_change
+                    self.journal.append("attempt.ready", ready)
+                    return ready
                 paths = require_claimed_changes(worktree, order.path_claims)
                 commit = commit_claimed(
                     repository=worktree,
