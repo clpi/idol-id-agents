@@ -83,10 +83,15 @@ def _run_guarded_process(
     assert process is not None
     try:
         stdout, process_stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        stdout, process_stderr = kill_group_and_reap(process)
-        exc.stdout = stdout
-        exc.stderr = process_stderr
+    except BaseException as exc:
+        try:
+            stdout, process_stderr = kill_group_and_reap(process)
+        except BaseException:
+            pass
+        else:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                exc.stdout = stdout
+                exc.stderr = process_stderr
         raise
     return subprocess.CompletedProcess(command, process.returncode, stdout, process_stderr)
 

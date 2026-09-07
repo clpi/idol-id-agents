@@ -475,6 +475,34 @@ class GitMutationGuardTests(unittest.TestCase):
         killpg.assert_called_once_with(process.pid, signal.SIGKILL)
         self.assertEqual(communications, 2)
 
+    def test_interrupt_kills_group_and_reaps(self) -> None:
+        process = ImmediateProcess(["git", "push"])
+        process.returncode = None
+        communications = 0
+
+        def communicate(timeout=None):
+            nonlocal communications
+            communications += 1
+            if communications == 1:
+                raise KeyboardInterrupt
+            process.returncode = -signal.SIGKILL
+            return "", None
+
+        process.communicate = communicate
+
+        @contextmanager
+        def launch_guard():
+            yield
+
+        with (
+            mock.patch("fleet_control.gitops.subprocess.Popen", return_value=process),
+            mock.patch("fleet_control.processes.os.killpg") as killpg,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            publish_branch(Path("/repository"), "bounded", launch_guard=launch_guard)
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        self.assertEqual(communications, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
