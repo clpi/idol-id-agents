@@ -6,6 +6,7 @@ on:
     paths:
       - scripts/allowance_plan.py
       - tests/test_allowance_plan.py
+      - requirements.txt
       - config/allowance-policy.example.json
       - docs/ALLOWANCE_COORDINATOR.md
       - .github/workflows/allowance-planner-test.yml
@@ -13,6 +14,7 @@ on:
     paths:
       - scripts/allowance_plan.py
       - tests/test_allowance_plan.py
+      - requirements.txt
       - config/allowance-policy.example.json
       - docs/ALLOWANCE_COORDINATOR.md
       - .github/workflows/allowance-planner-test.yml
@@ -27,6 +29,8 @@ jobs:
     timeout-minutes: 3
     steps:
       - uses: actions/checkout@v6
+      - name: Install pinned Python runtime
+        run: python3 -m pip install --disable-pip-version-check -r requirements.txt
       - name: Compile and run fail-closed controls
         shell: bash
         run: |
