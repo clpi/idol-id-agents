@@ -1,15 +1,45 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
+import shlex
 import signal
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
-from fleet_control.gitops import commit_claimed, create_draft_pull_request, publish_branch
+from fleet_control.control import LocalControl
+from fleet_control.gitops import (
+    _run_guarded_process,
+    commit_claimed,
+    create_draft_pull_request,
+    create_worktree,
+    fast_forward,
+    fetch_remote_branch,
+    publish_branch,
+)
+
+
+def process_stopped(pid: int, *, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        try:
+            process_stat = Path(f"/proc/{pid}/stat").read_text()
+        except FileNotFoundError:
+            pass
+        else:
+            if process_stat.rsplit(")", 1)[1].split()[0] == "Z":
+                return True
+        time.sleep(0.01)
+    return False
 
 
 class LocalControlDisabled(RuntimeError):
@@ -34,6 +64,243 @@ class ImmediateProcess:
 
 
 class GitMutationGuardTests(unittest.TestCase):
+    @staticmethod
+    def git(repository: Path, *arguments: str) -> str:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout.strip()
+
+    def repository(self, root: Path) -> tuple[Path, str]:
+        repository = root / "repository"
+        repository.mkdir()
+        self.git(repository, "init", "-b", "main")
+        self.git(repository, "config", "user.name", "Fleet Test")
+        self.git(repository, "config", "user.email", "fleet@example.test")
+        (repository / "subject.txt").write_text("base\n", encoding="utf-8")
+        self.git(repository, "add", "subject.txt")
+        self.git(repository, "commit", "-m", "base")
+        return repository, self.git(repository, "rev-parse", "HEAD")
+
+    @staticmethod
+    def install_delayed_hook(repository: Path, name: str, child: Path, marker: Path) -> None:
+        hook = repository / ".git/hooks" / name
+        hook.write_text(
+            "#!/bin/sh\n"
+            "(\n"
+            "  sleep 0.4\n"
+            f"  : > {shlex.quote(str(marker))}\n"
+            ") &\n"
+            f"printf '%s\\n' \"$!\" > {shlex.quote(str(child))}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        hook.chmod(0o755)
+
+    def test_maintenance_mutations_use_owned_session_runner(self) -> None:
+        repository = Path("/authority")
+        old_sha = "1" * 40
+        new_sha = "2" * 40
+        with (
+            mock.patch("fleet_control.gitops.current_branch", return_value="main"),
+            mock.patch("fleet_control.gitops.current_sha", side_effect=(old_sha, new_sha)),
+            mock.patch("fleet_control.gitops.is_dirty", side_effect=(False, False)),
+            mock.patch("fleet_control.gitops.is_ancestor", return_value=True),
+            mock.patch("fleet_control.gitops._run_mutating_git") as mutation,
+        ):
+            fast_forward(repository, branch="main", new_sha=new_sha)
+        mutation.assert_called_once_with(
+            repository,
+            ("merge", "--ff-only", new_sha),
+            timeout=180,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "authority"
+            path = root / "worktrees/bounded"
+            repository.mkdir()
+            branch_absent = subprocess.CompletedProcess([], 1, "")
+            with (
+                mock.patch("fleet_control.gitops.require_exact_subject"),
+                mock.patch("fleet_control.gitops.run", return_value=branch_absent),
+                mock.patch("fleet_control.gitops.current_sha", return_value=new_sha),
+                mock.patch("fleet_control.gitops._run_mutating_git") as mutation,
+            ):
+                create_worktree(
+                    repository=repository,
+                    path=path,
+                    branch="bounded",
+                    base_sha=new_sha,
+                )
+            self.assertEqual(
+                mutation.call_args_list,
+                [
+                    mock.call(
+                        repository,
+                        (
+                            "worktree",
+                            "add",
+                            "--no-checkout",
+                            "-b",
+                            "bounded",
+                            str(path),
+                            new_sha,
+                        ),
+                        timeout=180,
+                    ),
+                    mock.call(path, ("checkout", "--detach", new_sha)),
+                    mock.call(path, ("switch", "-C", "bounded", new_sha)),
+                ],
+            )
+
+        resolved = subprocess.CompletedProcess([], 0, f"{new_sha}\n")
+        with (
+            mock.patch("fleet_control.gitops._run_mutating_git") as mutation,
+            mock.patch("fleet_control.gitops.run", return_value=resolved),
+        ):
+            self.assertEqual(
+                fetch_remote_branch(repository, remote="origin", branch="main"),
+                new_sha,
+            )
+        mutation.assert_called_once_with(
+            repository,
+            (
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ),
+            timeout=120,
+        )
+
+    def test_fast_forward_timeout_stops_hook_descendant_before_disable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository, old_sha = self.repository(root)
+            self.git(repository, "switch", "-c", "remote")
+            (repository / "subject.txt").write_text("next\n", encoding="utf-8")
+            self.git(repository, "commit", "-am", "next")
+            new_sha = self.git(repository, "rev-parse", "HEAD")
+            self.git(repository, "switch", "main")
+            child_path = root / "child.pid"
+            late_write = root / "late-write"
+            self.install_delayed_hook(repository, "post-merge", child_path, late_write)
+            real_runner = _run_guarded_process
+            control = LocalControl(root / "control")
+            control.enable(60)
+            mutation_started = None
+
+            @contextmanager
+            def wait_for_hook_launch():
+                yield
+                deadline = time.monotonic() + 2
+                while not child_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not child_path.exists():
+                    raise AssertionError("post-merge hook did not launch")
+
+            def bounded_runner(command, **kwargs):
+                nonlocal mutation_started
+                mutation_started = time.monotonic()
+                kwargs["timeout"] = 0.1
+                kwargs["launch_guard"] = wait_for_hook_launch
+                return real_runner(command, **kwargs)
+
+            child_pid = None
+            try:
+                with (
+                    control.transition_permit("maintenance"),
+                    mock.patch("fleet_control.gitops.current_branch", return_value="main"),
+                    mock.patch("fleet_control.gitops.current_sha", return_value=old_sha),
+                    mock.patch("fleet_control.gitops.is_dirty", return_value=False),
+                    mock.patch("fleet_control.gitops.is_ancestor", return_value=True),
+                    mock.patch("fleet_control.gitops._run_guarded_process", side_effect=bounded_runner),
+                    self.assertRaises(subprocess.TimeoutExpired),
+                ):
+                    fast_forward(repository, branch="main", new_sha=new_sha)
+                self.assertIsNotNone(mutation_started)
+                elapsed = time.monotonic() - mutation_started
+                self.assertEqual(control.disable().mode, "disabled")
+                self.assertLess(elapsed, 3.0)
+                child_pid = int(child_path.read_text(encoding="utf-8"))
+                self.assertTrue(process_stopped(child_pid))
+                time.sleep(0.5)
+                self.assertFalse(late_write.exists())
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_create_worktree_timeout_stops_hook_descendant_before_disable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository, base_sha = self.repository(root)
+            child_path = root / "child.pid"
+            late_write = root / "late-write"
+            self.install_delayed_hook(repository, "post-checkout", child_path, late_write)
+            worktree = root / "worktrees/bounded"
+            real_runner = _run_guarded_process
+            control = LocalControl(root / "control")
+            control.enable(60)
+            with control.transition_permit("claim") as claim_guard:
+                attempt_permit = claim_guard.issue_attempt_permit("worktree-test")
+            mutation_started = None
+
+            @contextmanager
+            def wait_for_hook_launch():
+                yield
+                deadline = time.monotonic() + 2
+                while not child_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                if not child_path.exists():
+                    raise AssertionError("post-checkout hook did not launch")
+
+            def bounded_runner(command, **kwargs):
+                nonlocal mutation_started
+                if command[1] == "checkout":
+                    mutation_started = time.monotonic()
+                    kwargs["timeout"] = 0.1
+                    kwargs["launch_guard"] = wait_for_hook_launch
+                return real_runner(command, **kwargs)
+
+            child_pid = None
+            try:
+                with (
+                    control.transition_permit("worktree", attempt_permit),
+                    mock.patch("fleet_control.gitops._run_guarded_process", side_effect=bounded_runner),
+                    self.assertRaises(subprocess.TimeoutExpired),
+                ):
+                    create_worktree(
+                        repository=repository,
+                        path=worktree,
+                        branch="bounded",
+                        base_sha=base_sha,
+                    )
+                self.assertIsNotNone(mutation_started)
+                elapsed = time.monotonic() - mutation_started
+                self.assertEqual(control.disable().mode, "disabled")
+                self.assertLess(elapsed, 3.0)
+                child_pid = int(child_path.read_text(encoding="utf-8"))
+                self.assertTrue(process_stopped(child_pid))
+                time.sleep(0.5)
+                self.assertFalse(late_write.exists())
+            finally:
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_commit_guards_every_mutating_git_launch(self) -> None:
         expected = (
             ("git", "config", "user.name", "Fleet"),
@@ -207,6 +474,53 @@ class GitMutationGuardTests(unittest.TestCase):
             publish_branch(Path("/repository"), "bounded", launch_guard=launch_guard)
         killpg.assert_called_once_with(process.pid, signal.SIGKILL)
         self.assertEqual(communications, 2)
+
+    def test_interrupt_kills_group_and_reaps(self) -> None:
+        process = ImmediateProcess(["git", "push"])
+        process.returncode = None
+        communications = 0
+
+        def communicate(timeout=None):
+            nonlocal communications
+            communications += 1
+            if communications == 1:
+                raise KeyboardInterrupt
+            process.returncode = -signal.SIGKILL
+            return "", None
+
+        process.communicate = communicate
+
+        @contextmanager
+        def launch_guard():
+            yield
+
+        with (
+            mock.patch("fleet_control.gitops.subprocess.Popen", return_value=process),
+            mock.patch("fleet_control.processes.os.killpg") as killpg,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            publish_branch(Path("/repository"), "bounded", launch_guard=launch_guard)
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        self.assertEqual(communications, 2)
+
+    def test_cleanup_failure_is_never_suppressed(self) -> None:
+        process = ImmediateProcess(["git", "push"])
+        process.returncode = None
+
+        def communicate(timeout=None):
+            raise KeyboardInterrupt
+
+        process.communicate = communicate
+        cleanup_failure = RuntimeError("owned Git session was not reaped")
+
+        with (
+            mock.patch("fleet_control.gitops.subprocess.Popen", return_value=process),
+            mock.patch("fleet_control.gitops.kill_group_and_reap", side_effect=cleanup_failure),
+            self.assertRaisesRegex(RuntimeError, "owned Git session was not reaped") as caught,
+        ):
+            publish_branch(Path("/repository"), "bounded")
+        self.assertIs(caught.exception, cleanup_failure)
+        self.assertIsInstance(caught.exception.__context__, KeyboardInterrupt)
 
 
 if __name__ == "__main__":
