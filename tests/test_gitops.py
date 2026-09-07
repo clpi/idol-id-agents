@@ -503,6 +503,25 @@ class GitMutationGuardTests(unittest.TestCase):
         killpg.assert_called_once_with(process.pid, signal.SIGKILL)
         self.assertEqual(communications, 2)
 
+    def test_cleanup_failure_is_never_suppressed(self) -> None:
+        process = ImmediateProcess(["git", "push"])
+        process.returncode = None
+
+        def communicate(timeout=None):
+            raise KeyboardInterrupt
+
+        process.communicate = communicate
+        cleanup_failure = RuntimeError("owned Git session was not reaped")
+
+        with (
+            mock.patch("fleet_control.gitops.subprocess.Popen", return_value=process),
+            mock.patch("fleet_control.gitops.kill_group_and_reap", side_effect=cleanup_failure),
+            self.assertRaisesRegex(RuntimeError, "owned Git session was not reaped") as caught,
+        ):
+            publish_branch(Path("/repository"), "bounded")
+        self.assertIs(caught.exception, cleanup_failure)
+        self.assertIsInstance(caught.exception.__context__, KeyboardInterrupt)
+
 
 if __name__ == "__main__":
     unittest.main()
