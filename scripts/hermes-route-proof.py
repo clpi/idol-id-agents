@@ -9,6 +9,8 @@ import subprocess
 import sys
 import urllib.request
 
+import yaml
+
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Prove one fixed-cost Hermes route without inference")
@@ -40,22 +42,17 @@ def auth_state() -> dict:
 
 def no_fallbacks() -> None:
     path = Path.home() / ".hermes/config.yaml"
-    if not path.is_file():
-        return
-    lines = path.read_text(encoding="utf-8").splitlines()
-    for index, line in enumerate(lines):
-        if not line.startswith("fallback_providers:"):
-            continue
-        value = line.split(":", 1)[1].strip()
-        if value not in {"", "[]", "null", "~"}:
-            raise RuntimeError("Hermes fallback_providers is not empty")
-        if not value:
-            for child in lines[index + 1 :]:
-                if child and not child[0].isspace():
-                    break
-                if child.strip().startswith("-"):
-                    raise RuntimeError("Hermes fallback_providers is not empty")
-        return
+    try:
+        config = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise RuntimeError("Hermes configuration is unavailable or invalid") from exc
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise RuntimeError("Hermes configuration is not a mapping")
+    fallbacks = config.get("fallback_providers")
+    if fallbacks is not None and (not isinstance(fallbacks, list) or fallbacks):
+        raise RuntimeError("Hermes fallback_providers is not an empty list or null")
 
 
 def oauth_logged_in(provider: str) -> None:
