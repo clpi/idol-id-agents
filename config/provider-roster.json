@@ -1,0 +1,54 @@
+{
+  "observed": "2026-09-25",
+  "note": "Account evidence is a mailbox or OAuth fact. It is not a session, a key, or permission to spend. Metered routes stay disabled.",
+  "providers": [
+    {
+      "id": "zo",
+      "route_id": "zo-computer",
+      "billing": "unknown",
+      "account": "chrisp1877@gmail.com",
+      "evidence": "welcome mail 2026-09-24 from help@hey.zocomputer.com; no session token in that mail",
+      "must_stay_disabled": true
+    },
+    {
+      "id": "autohand",
+      "route_id": "autohand-code",
+      "billing": "unknown",
+      "account": "chrisp1877@gmail.com",
+      "evidence": "Autohand Code welcome 2026-09-24 says the account is verified and names an included Fantail allowance. No local proof of that allowance is on this host.",
+      "must_stay_disabled": true
+    },
+    {
+      "id": "poolside",
+      "route_id": "poolside-assistant",
+      "billing": "unknown",
+      "account": null,
+      "evidence": "named in the idol-id-agents description; no route, no mail, no auth file",
+      "must_stay_disabled": true
+    },
+    {
+      "id": "inception",
+      "route_id": "inception-platform",
+      "billing": "paygo",
+      "account": "github:clpi",
+      "evidence": "GitHub OAuth app Inception Platform authorized 2026-08-25 with read:user and user:email only",
+      "must_stay_disabled": true
+    },
+    {
+      "id": "apodex",
+      "route_id": "apodex-verifier",
+      "billing": "paygo",
+      "account": "not-chrisp1877@gmail.com",
+      "evidence": "Marketing mail went to chris@pecunies.com and clp@clp.im. None went to chrisp1877@gmail.com. GitHub OAuth Apodex on clpi is user:email only. No session id and no API key.",
+      "must_stay_disabled": true
+    },
+    {
+      "id": "jev",
+      "route_id": "jev-advisory",
+      "billing": "unknown",
+      "account": null,
+      "evidence": "Hermes exposes jev_decide as an advisory scorer. It is not a chat model and it is not an implementer.",
+      "must_stay_disabled": true
+    }
+  ]
+}
