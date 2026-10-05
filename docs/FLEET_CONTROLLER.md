@@ -50,6 +50,8 @@ Allowed no-change evidence is reviewable only when its stdout is complete and no
 
 Assignments with disjoint path and semantic claims execute concurrently up to `max_assignments`. Claiming, journal writes, and worktree creation remain serialized by their own locks.
 
+The scheduler first preserves score-ranked route preferences. If that leaves admission slots unused, it can move already-selected orders along a chain of eligible fallback routes to make room for a waiting order. Only previously admitted order/route pairs participate; active attempts are never moved, and billing proofs, allowance checks, reviewer independence, claim exclusions, route parallel limits, and the controller's assignment bound remain unchanged. Claim-conflicting orders are still selected greedily, not by a global packing optimizer.
+
 Unused included allowance is not itself waste. The objective is accepted semantic progress per marginal token. When a reset approaches, the scheduler expands into counterexample search, fixture generation, reduction, differential tests, artifact inspection, and independent review before starting speculative implementation that cannot finish coherently.
 
 ## Runtime adapters
