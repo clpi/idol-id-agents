@@ -68,6 +68,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise IntakeRefusal("mode must be observe-plan or apply")
     if not re.fullmatch(r"C[A-Z0-9]+", str(raw.get("channel", ""))):
         raise IntakeRefusal("channel must be a Slack channel id")
+    trusted = raw.get("trusted_users")
+    if not isinstance(trusted, list) or not trusted or not all(
+            isinstance(user, str) and re.fullmatch(r"[UW][A-Z0-9]+", user) for user in trusted):
+        raise IntakeRefusal("trusted_users must be a non-empty list of Slack user ids")
     agents = raw.get("agents")
     if not isinstance(agents, list) or not agents:
         raise IntakeRefusal("agents must be a non-empty list")
@@ -118,7 +122,7 @@ class Ledger:
         os.replace(name, self.path)
 
 
-def candidates(messages: Sequence[Mapping[str, Any]], skip_users: set[str],
+def candidates(messages: Sequence[Mapping[str, Any]], trusted_users: set[str],
                ledger: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     selected = []
     for message in messages:
@@ -129,7 +133,7 @@ def candidates(messages: Sequence[Mapping[str, Any]], skip_users: set[str],
             continue
         if message.get("thread_ts") not in (None, ts):
             continue
-        if message.get("user") in skip_users:
+        if message.get("user") not in trusted_users:
             continue
         if not str(message.get("text", "")).strip():
             continue
@@ -223,7 +227,7 @@ def cycle(config: Mapping[str, Any], routes: Mapping[str, Route], ledger: Ledger
     apply = config.get("mode") == "apply"
     agents = config["agents"]
     agent_users = {agent["user_id"] for agent in agents}
-    skip_users = agent_users | set(config.get("ignore_users", ()))
+    trusted_users = set(config.get("trusted_users", ())) - agent_users - set(config.get("ignore_users", ()))
     history_token = os.environ.get(config.get("history_token_env", agents[0]["token_env"]), "")
     if not history_token:
         raise IntakeRefusal("history token environment is absent")
@@ -231,7 +235,7 @@ def cycle(config: Mapping[str, Any], routes: Mapping[str, Route], ledger: Ledger
     history = transport("conversations.history", history_token,
                         {"channel": config["channel"], "oldest": f"{oldest:.6f}", "limit": "100"})
     decisions = []
-    for message in candidates(history.get("messages", ()), skip_users, ledger.data):
+    for message in candidates(history.get("messages", ()), trusted_users, ledger.data):
         ts = str(message["ts"])
         if message.get("reply_count"):
             replies = transport("conversations.replies", history_token,
