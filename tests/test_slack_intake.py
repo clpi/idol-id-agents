@@ -196,10 +196,61 @@ class SlackIntakeTests(unittest.TestCase):
         self.assertTrue(routes)
         self.assertTrue(all(not item.enabled for item in routes.values()))
 
+    def test_fanout_hands_one_message_to_several_apps(self) -> None:
+        self.config["agents"].append(
+            {"name": "Synthetic", "user_id": "USYN", "token_env": "SYN_BOT", "route": "synthetic"})
+        routes = dict(self.routes, synthetic=route("synthetic"))
+        config = dict(self.config, fanout=2)
+        slack = FakeSlack([{"ts": "1.0", "user": "UHUMAN", "text": "status of everything"},
+                           {"ts": "2.0", "user": "UHUMAN", "text": "next"}])
+        with mock.patch.dict(os.environ, {"SYN_BOT": "xoxb-s"}):
+            decisions = self.run_cycle(slack, config=config, routes=routes)
+        self.assertEqual([(d["ts"], d["agent"], d["status"]) for d in decisions],
+                         [("1.0", "MiniMax", "replied"), ("1.0", "FactoryDroid", "replied"),
+                          ("2.0", "Synthetic", "replied"), ("2.0", "MiniMax", "replied")])
+        self.assertEqual([token for token, _ in slack.posts], ["xoxb-m", "xoxb-f", "xoxb-s", "xoxb-m"])
+        self.assertEqual(self.run_cycle(slack, config=config, routes=routes), [])
+
+    def test_app_without_bot_token_is_skipped_for_the_next_ready_app(self) -> None:
+        self.config["agents"].insert(
+            0, {"name": "Ona", "user_id": "UONA", "token_env": "ONA_BOT", "route": "factory"})
+        slack = FakeSlack([{"ts": "1.0", "user": "UHUMAN", "text": "do work"}])
+        decisions = self.run_cycle(slack)
+        self.assertEqual((decisions[0]["agent"], decisions[0]["status"]), ("MiniMax", "replied"))
+        self.assertEqual([token for token, _ in slack.posts], ["xoxb-m"])
+
+    def test_tagging_several_apps_reaches_each_ready_one(self) -> None:
+        slack = FakeSlack([{"ts": "1.0", "user": "UHUMAN", "text": "<@UMINI> <@UFACT> both look"}])
+        decisions = self.run_cycle(slack)
+        self.assertEqual([d["agent"] for d in decisions], ["MiniMax", "FactoryDroid"])
+        self.assertEqual(len(slack.posts), 2)
+
+    def test_status_reports_each_app_readiness(self) -> None:
+        self.config["agents"].append(
+            {"name": "Cue", "user_id": "UCUE", "token_env": "CUE_BOT", "route": "cue"})
+        routes = dict(self.routes, factory=route("factory", BillingClass.PAYGO))
+        report = {line["agent"]: line for line in intake.status(self.config, routes, NOW)}
+        self.assertTrue(report["MiniMax"]["ready"])
+        self.assertIn("billing-paygo-forbidden", report["FactoryDroid"]["reasons"])
+        self.assertEqual(report["Cue"]["reasons"], ["token-missing", "route-missing"])
+
+    def test_config_refuses_duplicate_or_malformed_app_ids_and_fanout(self) -> None:
+        path = Path(self.tmp.name) / "intake.json"
+        agent = {"name": "A", "user_id": "UA", "token_env": "T", "route": "r"}
+        for change in ({"agents": [agent, dict(agent, name="B")]},
+                       {"agents": [dict(agent, user_id="CUE_SLACK_USER_ID")]},
+                       {"fanout": 0}, {"fanout": True}):
+            path.write_text(__import__("json").dumps(dict(self.config, fleet_config="x", **change)))
+            with self.assertRaises(intake.IntakeRefusal):
+                intake.load_config(path)
+
     def test_example_config_loads_in_observe_plan(self) -> None:
         config = intake.load_config(ROOT / "config/slack-intake.example.json")
         self.assertEqual(config["mode"], "observe-plan")
-
+        names = {agent["name"] for agent in config["agents"]}
+        self.assertTrue({"Ona", "Factory", "Synthetic", "HermesMini", "Claw", "Mimo", "Qwen",
+                         "Cue", "DotBridge"} <= names)
+        self.assertNotIn("U0C3P7NEZU7", {agent["user_id"] for agent in config["agents"]})
 
 if __name__ == "__main__":
     unittest.main()

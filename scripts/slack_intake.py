@@ -2,9 +2,10 @@
 """Untagged Slack intake for the non-Devin fleet apps.
 
 Polls one channel, selects top-level human messages that no fleet app has
-answered, rotates them across configured Slack apps whose fleet route passes
-the zero-pay-go policy, runs that route without a shell, and replies in thread
-with the same app's bot token. Observe-plan is the default mode.
+answered, hands each one to the next ``fanout`` configured Slack apps whose bot
+token is present and whose fleet route passes the zero-pay-go policy, runs each
+route without a shell, and replies in thread with the same app's bot token.
+Observe-plan is the default mode; ``--status`` reports every app's readiness.
 """
 
 from __future__ import annotations
@@ -79,6 +80,14 @@ def load_config(path: Path) -> dict[str, Any]:
         for key in ("name", "user_id", "token_env", "route"):
             if not isinstance(agent.get(key), str) or not agent[key]:
                 raise IntakeRefusal(f"agent field {key} is required")
+        if not re.fullmatch(r"[UW][A-Z0-9]+", agent["user_id"]):
+            raise IntakeRefusal(f"agent {agent['name']} user_id must be a Slack user id")
+    users = [agent["user_id"] for agent in agents]
+    if len(set(users)) != len(users):
+        raise IntakeRefusal("agent user_id values must be unique")
+    fanout = raw.get("fanout", 1)
+    if not isinstance(fanout, int) or isinstance(fanout, bool) or fanout < 1:
+        raise IntakeRefusal("fanout must be a positive integer")
     return raw
 
 
@@ -145,26 +154,51 @@ def answered(replies: Sequence[Mapping[str, Any]], agent_users: set[str], ts: st
     return any(item.get("ts") != ts and item.get("user") in agent_users for item in replies)
 
 
+def readiness(agent: Mapping[str, Any], routes: Mapping[str, Route], now: float) -> tuple[str, ...]:
+    reasons = []
+    if not os.environ.get(agent["token_env"]):
+        reasons.append("token-missing")
+    route = routes.get(agent["route"])
+    if route is None:
+        reasons.append("route-missing")
+    else:
+        reasons.extend(route_verdict(route, now=now).reasons)
+    return tuple(reasons)
+
+
 def choose(message: Mapping[str, Any], agents: Sequence[Mapping[str, Any]],
-           routes: Mapping[str, Route], cursor: int, now: float) -> tuple[Mapping[str, Any] | None, str]:
+           routes: Mapping[str, Route], cursor: int, now: float,
+           fanout: int = 1) -> tuple[list[Mapping[str, Any]], str]:
     mentioned = set(MENTION_RE.findall(str(message.get("text", ""))))
     pool = list(agents)
     if mentioned:
         pool = [agent for agent in agents if agent["user_id"] in mentioned]
         if not pool:
-            return None, "addressed-elsewhere"
+            return [], "addressed-elsewhere"
+        fanout = len(pool)
+    selected: list[Mapping[str, Any]] = []
     refusals = []
     for offset in range(len(pool)):
         agent = pool[(cursor + offset) % len(pool)]
-        route = routes.get(agent["route"])
-        if route is None:
-            refusals.append(f"{agent['name']}:route-missing")
+        reasons = readiness(agent, routes, now)
+        if reasons:
+            refusals.append(f"{agent['name']}:{','.join(reasons)}")
             continue
-        verdict = route_verdict(route, now=now)
-        if verdict.allowed:
-            return agent, "selected"
-        refusals.append(f"{agent['name']}:{','.join(verdict.reasons)}")
-    return None, "no-admitted-route:" + ";".join(refusals)
+        selected.append(agent)
+        if len(selected) == fanout:
+            break
+    if selected:
+        return selected, "selected"
+    return [], "no-admitted-route:" + ";".join(refusals)
+
+
+def status(config: Mapping[str, Any], routes: Mapping[str, Route], now: float) -> list[dict[str, Any]]:
+    report = []
+    for agent in config["agents"]:
+        reasons = readiness(agent, routes, now)
+        report.append({"agent": agent["name"], "user_id": agent["user_id"], "route": agent["route"],
+                       "token_env": agent["token_env"], "ready": not reasons, "reasons": list(reasons)})
+    return report
 
 
 def prompt_for(config: Mapping[str, Any], message: Mapping[str, Any], agent: Mapping[str, Any]) -> str:
@@ -245,37 +279,41 @@ def cycle(config: Mapping[str, Any], routes: Mapping[str, Route], ledger: Ledger
                     ledger.record(ts, {"status": "already-answered", "at": current})
                 decisions.append({"ts": ts, "status": "already-answered"})
                 continue
-        agent, reason = choose(message, agents, routes, int(ledger.data.get("cursor", 0)), current)
-        decision: dict[str, Any] = {"ts": ts, "agent": agent["name"] if agent else None, "status": reason}
-        decisions.append(decision)
+        cursor = int(ledger.data.get("cursor", 0))
+        selected, reason = choose(message, agents, routes, cursor, current, int(config.get("fanout", 1)))
+        if not selected:
+            decisions.append({"ts": ts, "agent": None, "status": reason})
+            if apply:
+                ledger.record(ts, {"status": reason, "at": current})
+            continue
+        batch = [{"ts": ts, "agent": agent["name"], "status": reason} for agent in selected]
+        decisions.extend(batch)
         if not apply:
             continue
-        if agent is None:
-            ledger.record(ts, {"status": reason, "at": current})
-            continue
-        ledger.data["cursor"] = int(ledger.data.get("cursor", 0)) + 1
-        ledger.record(ts, {"status": "claimed", "agent": agent["name"], "at": current})
-        token = os.environ.get(agent["token_env"], "")
-        try:
-            if not token:
-                raise IntakeRefusal(f"{agent['token_env']} is absent")
-            reply = runner(routes[agent["route"]], prompt_for(config, message, agent),
-                           ledger.dir / "work" / ts.replace(".", "-"))
-            transport("chat.postMessage", token,
-                      {"channel": config["channel"], "thread_ts": ts, "text": reply})
-        except (IntakeRefusal, OSError, subprocess.SubprocessError) as exc:
-            decision["status"] = f"refused:{exc}"
-            ledger.record(ts, {"status": decision["status"], "agent": agent["name"], "at": current})
-            continue
-        decision["status"] = "replied"
-        ledger.record(ts, {"status": "replied", "agent": agent["name"], "at": current})
+        ledger.data["cursor"] = cursor + len(selected)
+        outcomes = {agent["name"]: "claimed" for agent in selected}
+        ledger.record(ts, {"status": "claimed", "agents": dict(outcomes), "at": current})
+        for agent, decision in zip(selected, batch):
+            try:
+                reply = runner(routes[agent["route"]], prompt_for(config, message, agent),
+                               ledger.dir / "work" / ts.replace(".", "-") / agent["user_id"])
+                transport("chat.postMessage", os.environ[agent["token_env"]],
+                          {"channel": config["channel"], "thread_ts": ts, "text": reply})
+            except (IntakeRefusal, OSError, KeyError, subprocess.SubprocessError) as exc:
+                decision["status"] = f"refused:{exc}"
+            else:
+                decision["status"] = "replied"
+            outcomes[agent["name"]] = decision["status"]
+            ledger.record(ts, {"status": "attempted", "agents": dict(outcomes), "at": current})
     return decisions
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
-    parser.add_argument("--loop", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--loop", action="store_true")
+    mode.add_argument("--status", action="store_true", help="print each app's readiness and exit")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
@@ -283,6 +321,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (IntakeRefusal, OSError, ValueError) as exc:
         print(json.dumps({"status": f"config-refused:{exc}"}), flush=True)
         return 2
+    if args.status:
+        report = status(config, routes, time.time())
+        for line in report:
+            print(json.dumps(line, sort_keys=True), flush=True)
+        return 0 if any(line["ready"] for line in report) else 1
     while True:
         try:
             with Ledger(Path(config.get("state_dir", "~/.local/state/idol-slack-intake"))) as ledger:
