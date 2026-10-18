@@ -24,6 +24,69 @@ from fleet_control.claims import (
 
 
 class ClaimTests(unittest.TestCase):
+    def test_failed_unlock_closes_handle_and_preserves_committed_state(self) -> None:
+        for failure in (OSError, KeyboardInterrupt):
+            for operation in ("constructor", "list", "acquire", "renew", "release"):
+                with self.subTest(failure=failure, operation=operation), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    store = SemanticClaimStore(root)
+                    expired = asdict(store.acquire(owner="expired", task_id="expired", targets=("graph/expired",), ttl_seconds=30, now=0)[0])
+                    active = asdict(store.acquire(owner="one", task_id="task-one", targets=("graph/application",), ttl_seconds=60, now=10)[0])
+                    before = store.path.read_bytes()
+                    expected = {
+                        "constructor": [expired, active],
+                        "list": [active],
+                        "acquire": [active, dict(owner="two", task_id="task-two", target="graph/other", acquired_at=50, expires_at=110)],
+                        "renew": [{**active, "expires_at": 140}],
+                        "release": [expired],
+                    }[operation]
+                    operations = {
+                        "constructor": lambda: SemanticClaimStore(root),
+                        "list": lambda: store.list(now=50),
+                        "acquire": lambda: store.acquire(owner="two", task_id="task-two", targets=("graph/other",), ttl_seconds=60, now=50),
+                        "renew": lambda: store.renew(owner="one", task_id="task-one", ttl_seconds=90, now=50),
+                        "release": lambda: store.release(owner="one", task_id="task-one"),
+                    }
+                    original_open = Path.open
+                    original_flock = fcntl.flock
+                    opened = []
+                    calls = []
+                    captured = None
+
+                    def track(path, *args, **kwargs):
+                        handle = original_open(path, *args, **kwargs)
+                        if path == store.lock_path:
+                            opened.append(handle)
+                        return handle
+
+                    def fail_unlock(fd, mode):
+                        calls.append(mode)
+                        if len(calls) == 2:
+                            self.assertEqual(mode, fcntl.LOCK_UN)
+                            raise failure("planted unlock failure")
+                        return original_flock(fd, mode)
+
+                    try:
+                        with mock.patch.object(Path, "open", track), mock.patch.object(fcntl, "flock", side_effect=fail_unlock):
+                            try:
+                                operations[operation]()
+                            except failure as exc:
+                                captured = exc
+                        self.assertIsInstance(captured, failure)
+                        self.assertEqual(str(captured), "planted unlock failure")
+                        self.assertEqual(calls, [fcntl.LOCK_EX, fcntl.LOCK_UN])
+                        self.assertEqual(len(opened), 1)
+                        self.assertTrue(opened[0].closed)
+                        with store.lock_path.open("a+") as handle:
+                            original_flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            original_flock(handle.fileno(), fcntl.LOCK_UN)
+                        self.assertEqual(json.loads(store.path.read_bytes()), expected)
+                        if operation == "constructor":
+                            self.assertEqual(store.path.read_bytes(), before)
+                    finally:
+                        for handle in opened:
+                            handle.close()
+
     def test_failed_lock_acquisition_closes_handle_without_mutating_claims(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

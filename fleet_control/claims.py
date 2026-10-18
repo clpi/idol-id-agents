@@ -77,8 +77,7 @@ class SemanticClaimStore:
             if not self.path.exists():
                 self._write([])
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
     @staticmethod
     def _timestamp(value: object) -> bool:
@@ -155,6 +154,13 @@ class SemanticClaimStore:
         return handle
 
     @staticmethod
+    def _release_lock(handle) -> None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    @staticmethod
     def _live(rows: list[dict], now: float) -> list[dict]:
         return [row for row in rows if row["expires_at"] > now]
 
@@ -166,8 +172,7 @@ class SemanticClaimStore:
             self._write(rows)
             return tuple(Claim(**row) for row in rows)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
     def acquire(
         self,
@@ -209,8 +214,7 @@ class SemanticClaimStore:
             self._write(rows)
             return tuple(created)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
     def renew(
         self,
@@ -237,8 +241,7 @@ class SemanticClaimStore:
             self._write(updated)
             return tuple(Claim(**row) for row in updated if row.get("owner") == owner and row.get("task_id") == task_id)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
     def release(self, *, owner: str, task_id: str) -> None:
         lock = self._locked()
@@ -250,8 +253,7 @@ class SemanticClaimStore:
             ]
             self._write(rows)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
 
 class RepositoryClaimTransaction(AbstractContextManager["RepositoryClaimTransaction"]):
