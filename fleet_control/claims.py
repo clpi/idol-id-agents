@@ -147,7 +147,11 @@ class SemanticClaimStore:
 
     def _locked(self):
         handle = self.lock_path.open("a+")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except BaseException:
+            handle.close()
+            raise
         return handle
 
     @staticmethod

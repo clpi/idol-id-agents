@@ -24,6 +24,38 @@ from fleet_control.claims import (
 
 
 class ClaimTests(unittest.TestCase):
+    def test_failed_lock_acquisition_closes_handle_without_mutating_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SemanticClaimStore(root)
+            store.acquire(owner="one", task_id="task-one", targets=("graph/application",), ttl_seconds=60, now=10)
+            before = store.path.read_bytes()
+            original = Path.open
+            operations = (
+                lambda: SemanticClaimStore(root),
+                lambda: store.list(now=11),
+                lambda: store.acquire(owner="two", task_id="task-two", targets=("graph/application",), ttl_seconds=60, now=11),
+                lambda: store.renew(owner="one", task_id="task-one", ttl_seconds=60, now=11),
+                lambda: store.release(owner="one", task_id="task-one"),
+            )
+            for failure in (OSError, KeyboardInterrupt):
+                for operation in operations:
+                    with self.subTest(failure=failure, operation=operation):
+                        opened = []
+
+                        def track(path, *args, **kwargs):
+                            handle = original(path, *args, **kwargs)
+                            if path == store.lock_path:
+                                opened.append(handle)
+                            return handle
+
+                        with mock.patch.object(Path, "open", track), mock.patch.object(fcntl, "flock", side_effect=failure("planted lock failure")):
+                            with self.assertRaises(failure):
+                                operation()
+                        self.assertEqual(len(opened), 1)
+                        self.assertTrue(opened[0].closed)
+                        self.assertEqual(store.path.read_bytes(), before)
+
     def test_constructor_initialization_holds_store_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
