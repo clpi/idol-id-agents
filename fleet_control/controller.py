@@ -41,7 +41,7 @@ from .gitops import (
 )
 from .health import apply_circuits, circuit_state, record_failure, record_success
 from .journal import Journal
-from .model import Assignment, Route, WorkOrder, load_routes, mapping, sequence, stable_hash
+from .model import Assignment, Route, WorkOrder, load_routes, mapping, sequence, stable_hash, validate_relative_path
 from .policy import assert_order_route
 from .processes import kill_group_and_reap
 from .performance import route_factors
@@ -195,10 +195,20 @@ class FleetController:
         os.chmod(self.config.work_orders_dir, 0o700)
         self.journal = Journal(self.config.state_dir / "fleet-history.jsonl")
         self.semantic_claims = SemanticClaimStore(self.config.state_dir / "claims")
-        self.path_claims = SemanticClaimStore(self.config.state_dir / "path-claims")
+        self.path_claims = SemanticClaimStore(
+            self.config.state_dir / "path-claims",
+            target_validator=self._validate_path_claim_target,
+        )
         self.control = LocalControl(self.config.state_dir / "control")
         self.runtime = CommandRuntime(self.config.state_dir / "runtime", control=self.control)
         self.lease_path = self.config.state_dir / "controller.lock"
+
+    @staticmethod
+    def _validate_path_claim_target(target: str) -> None:
+        repository_subject, separator, path = target.partition("/")
+        if not separator or not re.fullmatch(r"[0-9a-f]{16}", repository_subject):
+            raise ValueError("invalid repository path claim subject")
+        validate_relative_path(path)
 
     @staticmethod
     def _calibration_circuit_route(route: Route) -> Route:

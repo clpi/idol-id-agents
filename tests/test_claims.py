@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import asdict
+import fcntl
+import json
 import os
 from pathlib import Path
 import shlex
@@ -13,6 +16,7 @@ from unittest import mock
 
 from fleet_control.claims import (
     ClaimConflict,
+    ClaimCommandError,
     ControllerLease,
     RepositoryClaimTransaction,
     SemanticClaimStore,
@@ -20,6 +24,142 @@ from fleet_control.claims import (
 
 
 class ClaimTests(unittest.TestCase):
+    def test_constructor_initialization_holds_store_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            initializing = threading.Event()
+            proceed = threading.Event()
+            competing = threading.Event()
+            failures: list[BaseException] = []
+            original = SemanticClaimStore._write
+
+            def delayed_write(store, rows):
+                if threading.current_thread().name == "first-initializer" and rows == []:
+                    initializing.set()
+                    if not proceed.wait(3):
+                        raise AssertionError("initialization was not resumed")
+                original(store, rows)
+
+            def initialize() -> None:
+                try:
+                    SemanticClaimStore(root)
+                except BaseException as exc:
+                    failures.append(exc)
+
+            def acquire() -> None:
+                competing.set()
+                try:
+                    store = SemanticClaimStore(root)
+                    store.acquire(owner="two", task_id="task-two", targets=("graph/application",), ttl_seconds=60, now=10)
+                except BaseException as exc:
+                    failures.append(exc)
+
+            with mock.patch.object(SemanticClaimStore, "_write", delayed_write):
+                first = threading.Thread(target=initialize, name="first-initializer")
+                second = threading.Thread(target=acquire, name="second-initializer")
+                first.start()
+                try:
+                    self.assertTrue(initializing.wait(2))
+                    second.start()
+                    self.assertTrue(competing.wait(2))
+                    with (root / "semantic-claims.lock").open("a+") as handle:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    proceed.set()
+                    first.join(3)
+                    if second.ident is not None:
+                        second.join(3)
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(failures, [])
+            self.assertEqual(tuple(row.owner for row in SemanticClaimStore(root).list(now=11)), ("two",))
+
+    def test_corrupt_rows_refuse_all_operations_without_rewriting_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SemanticClaimStore(Path(temporary))
+            claim = store.acquire(owner="one", task_id="task-one", targets=("graph/application",), ttl_seconds=60, now=10)[0]
+            valid = asdict(claim)
+            damaged = []
+            for field in valid:
+                row = dict(valid)
+                del row[field]
+                damaged.append(("missing-" + field, row))
+            for field in ("owner", "task_id", "target"):
+                for value in (None, 1, True, "", " "):
+                    damaged.append((field + "=" + repr(value), {**valid, field: value}))
+            for field in ("acquired_at", "expires_at"):
+                for value in (None, "60", True, -1, float("nan"), float("inf"), -float("inf"), 10 ** 1000):
+                    damaged.append((field + "=" + repr(value), {**valid, field: value}))
+            damaged.extend((
+                ("zero-duration", {**valid, "expires_at": 10}),
+                ("reversed-time", {**valid, "expires_at": 9}),
+                ("extra-field", {**valid, "unrecognized": 1}),
+                ("invalid-target", {**valid, "target": "graph//application"}),
+            ))
+            operations = (
+                ("list", lambda: store.list(now=11)),
+                ("acquire", lambda: store.acquire(owner="two", task_id="task-two", targets=("graph/application",), ttl_seconds=60, now=11)),
+                ("renew", lambda: store.renew(owner="one", task_id="task-one", ttl_seconds=60, now=11)),
+                ("release", lambda: store.release(owner="one", task_id="task-one")),
+            )
+            for damage, row in damaged:
+                for operation, call in operations:
+                    with self.subTest(damage=damage, operation=operation):
+                        original = json.dumps([row]).encode()
+                        store.path.write_bytes(original)
+                        with self.assertRaises(ClaimCommandError):
+                            call()
+                        self.assertEqual(store.path.read_bytes(), original)
+
+    def test_invalid_clock_or_ttl_cannot_discard_or_shorten_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SemanticClaimStore(Path(temporary))
+            store.acquire(owner="one", task_id="task-one", targets=("graph/application",), ttl_seconds=60, now=10)
+            original = store.path.read_bytes()
+            for now in (True, -1, float("nan"), float("inf"), "11", 10 ** 1000):
+                for operation in ("list", "acquire", "renew"):
+                    with self.subTest(now=repr(now), operation=operation):
+                        store.path.write_bytes(original)
+                        kwargs = {"now": now}
+                        if operation != "list":
+                            kwargs.update(owner="one", task_id="task-one", ttl_seconds=60)
+                        if operation == "acquire":
+                            kwargs["targets"] = ("graph/application",)
+                        with self.assertRaises(ValueError):
+                            getattr(store, operation)(**kwargs)
+                        self.assertEqual(store.path.read_bytes(), original)
+            for ttl in (True, -1, 29, 86401, 60.5, float("nan"), float("inf"), "60"):
+                for operation in ("acquire", "renew"):
+                    with self.subTest(ttl=repr(ttl), operation=operation):
+                        store.path.write_bytes(original)
+                        kwargs = dict(owner="one", task_id="task-one", ttl_seconds=ttl, now=11)
+                        if operation == "acquire":
+                            kwargs["targets"] = ("graph/application",)
+                        with self.assertRaises(ValueError):
+                            getattr(store, operation)(**kwargs)
+                        self.assertEqual(store.path.read_bytes(), original)
+
+    def test_renewal_and_exact_expiry_preserve_ownership_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SemanticClaimStore(Path(temporary))
+            store.acquire(owner="one", task_id="task-one", targets=("graph/application",), ttl_seconds=60, now=10)
+            renewed = store.renew(owner="one", task_id="task-one", ttl_seconds=90, now=50)
+            self.assertEqual(renewed[0].acquired_at, 10)
+            self.assertEqual(renewed[0].expires_at, 140)
+            with self.assertRaises(ClaimConflict):
+                store.acquire(owner="two", task_id="task-two", targets=("graph/application/operand",), ttl_seconds=60, now=139)
+            self.assertEqual(store.list(now=140), ())
+            acquired = store.acquire(owner="two", task_id="task-two", targets=("graph/application",), ttl_seconds=60, now=140)
+            self.assertEqual(acquired[0].owner, "two")
+
+    def test_independent_roots_are_only_local_claim_authorities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("first", "second"):
+                store = SemanticClaimStore(root / name)
+                self.assertEqual(len(store.acquire(owner=name, task_id=name, targets=("graph/application",), ttl_seconds=60, now=10)), 1)
+
     @staticmethod
     def claim_repository(root: Path, body: str) -> Path:
         repository = root / "repository"
