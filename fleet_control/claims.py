@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +13,7 @@ import time
 from typing import Callable, ContextManager, Iterable, Sequence
 
 from .processes import kill_group_and_reap
+from .model import validate_semantic_target
 from .scheduler import semantic_overlap
 
 
@@ -64,15 +66,63 @@ class ControllerLease(AbstractContextManager["ControllerLease"]):
 
 
 class SemanticClaimStore:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, target_validator: Callable[[str], None] = validate_semantic_target) -> None:
+        self.target_validator = target_validator
         self.root = Path(root).expanduser()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.root / "semantic-claims.json"
         self.lock_path = self.root / "semantic-claims.lock"
-        if not self.path.exists():
-            self._write([])
+        lock = self._locked()
+        try:
+            if not self.path.exists():
+                self._write([])
+        finally:
+            self._release_lock(lock)
+
+    @staticmethod
+    def _timestamp(value: object) -> bool:
+        if type(value) not in (int, float):
+            return False
+        try:
+            return math.isfinite(value) and value >= 0
+        except OverflowError:
+            return False
+
+    @classmethod
+    def _current(cls, now: float | None) -> float:
+        current = time.time() if now is None else now
+        if not cls._timestamp(current):
+            raise ValueError("invalid semantic claim observation time")
+        return current
+
+    @staticmethod
+    def _ttl(ttl_seconds: int) -> None:
+        if type(ttl_seconds) is not int or not 30 <= ttl_seconds <= 86400:
+            raise ValueError("semantic claim TTL outside supported bounds")
+
+    def _validate(self, rows: object) -> list[dict]:
+        if not isinstance(rows, list):
+            raise ClaimCommandError("semantic claim store has invalid shape")
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != set(Claim.__dataclass_fields__):
+                raise ClaimCommandError("semantic claim store has invalid fields")
+            for field in ("owner", "task_id", "target"):
+                if not isinstance(row[field], str) or not row[field].strip():
+                    raise ClaimCommandError("semantic claim store has invalid identity")
+            try:
+                self.target_validator(row["target"])
+            except ValueError as exc:
+                raise ClaimCommandError("semantic claim store has invalid target") from exc
+            if (
+                not self._timestamp(row["acquired_at"])
+                or not self._timestamp(row["expires_at"])
+                or row["expires_at"] <= row["acquired_at"]
+            ):
+                raise ClaimCommandError("semantic claim store has invalid lease times")
+        return rows
 
     def _write(self, rows: list[dict]) -> None:
+        self._validate(rows)
         temporary = self.path.with_suffix(".tmp")
         fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
         try:
@@ -92,29 +142,37 @@ class SemanticClaimStore:
                 value = json.load(handle)
         except (OSError, json.JSONDecodeError) as exc:
             raise ClaimCommandError("semantic claim store is unreadable") from exc
-        if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
-            raise ClaimCommandError("semantic claim store has invalid shape")
-        return value
+        return self._validate(value)
 
     def _locked(self):
         handle = self.lock_path.open("a+")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except BaseException:
+            handle.close()
+            raise
         return handle
 
     @staticmethod
+    def _release_lock(handle) -> None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+    @staticmethod
     def _live(rows: list[dict], now: float) -> list[dict]:
-        return [row for row in rows if float(row.get("expires_at", 0)) > now]
+        return [row for row in rows if row["expires_at"] > now]
 
     def list(self, *, now: float | None = None) -> tuple[Claim, ...]:
-        current = time.time() if now is None else now
+        current = self._current(now)
         lock = self._locked()
         try:
             rows = self._live(self._read(), current)
             self._write(rows)
             return tuple(Claim(**row) for row in rows)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
     def acquire(
         self,
@@ -125,13 +183,12 @@ class SemanticClaimStore:
         ttl_seconds: int,
         now: float | None = None,
     ) -> tuple[Claim, ...]:
-        if ttl_seconds < 30 or ttl_seconds > 86400:
-            raise ValueError("semantic claim TTL outside supported bounds")
+        self._ttl(ttl_seconds)
         if not targets:
             raise ValueError("semantic claims are required")
         if len(set(targets)) != len(targets):
             raise ValueError("duplicate semantic target")
-        current = time.time() if now is None else now
+        current = self._current(now)
         lock = self._locked()
         try:
             rows = self._live(self._read(), current)
@@ -157,8 +214,7 @@ class SemanticClaimStore:
             self._write(rows)
             return tuple(created)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
     def renew(
         self,
@@ -168,7 +224,8 @@ class SemanticClaimStore:
         ttl_seconds: int,
         now: float | None = None,
     ) -> tuple[Claim, ...]:
-        current = time.time() if now is None else now
+        self._ttl(ttl_seconds)
+        current = self._current(now)
         lock = self._locked()
         try:
             rows = self._live(self._read(), current)
@@ -184,8 +241,7 @@ class SemanticClaimStore:
             self._write(updated)
             return tuple(Claim(**row) for row in updated if row.get("owner") == owner and row.get("task_id") == task_id)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
     def release(self, *, owner: str, task_id: str) -> None:
         lock = self._locked()
@@ -197,8 +253,7 @@ class SemanticClaimStore:
             ]
             self._write(rows)
         finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-            lock.close()
+            self._release_lock(lock)
 
 
 class RepositoryClaimTransaction(AbstractContextManager["RepositoryClaimTransaction"]):

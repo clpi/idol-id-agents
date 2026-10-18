@@ -14,17 +14,80 @@ import unittest
 from unittest import mock
 
 from fleet_control.calibration import calibrate
+from fleet_control.claims import ClaimCommandError, ClaimConflict
 from fleet_control.controller import ControllerError, FleetController, load_config
 from fleet_control.control import LocalControl
 from fleet_control.evidence import retain_candidate_evidence
 from fleet_control.gitops import GitRefusal, current_sha
 from fleet_control.health import record_failure
-from fleet_control.model import stable_hash
+from fleet_control.model import stable_hash, validate_relative_path
 from fleet_control.runtime import RunResult
 from tests.process_helpers import process_stopped
 
 
 class ControllerTests(unittest.TestCase):
+    def test_path_claim_lifecycle_preserves_exact_paths_and_semantic_domain(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="observe-plan")
+        with temporary:
+            controller = FleetController(config_path=config_path)
+            paths = (
+                ".github/workflows/build.yml",
+                ".agents/WORK_ORDER.md",
+                ".gitignore",
+                "_private/item",
+                "dir/file with spaces.txt",
+                "données/火.txt",
+            )
+            subject = stable_hash(str(repo.resolve()))[:16]
+            targets = tuple(f"{subject}/{path}" for path in paths) + ("0000000000000000/.agents/prior.md",)
+            for path in paths:
+                validate_relative_path(path)
+                with self.subTest(semantic_target=path):
+                    with self.assertRaises(ClaimCommandError):
+                        controller.semantic_claims.acquire(owner="one", task_id="one", targets=(path,), ttl_seconds=60, now=10)
+            controller.path_claims.acquire(owner="one", task_id="one", targets=targets, ttl_seconds=60, now=10)
+            self.assertEqual(tuple(row.target for row in controller.path_claims.list(now=11)), targets)
+            with self.assertRaises(ClaimConflict):
+                controller.path_claims.acquire(owner="two", task_id="two", targets=(f"{subject}/.github/workflows",), ttl_seconds=60, now=11)
+            renewed = controller.path_claims.renew(owner="one", task_id="one", ttl_seconds=90, now=20)
+            self.assertEqual(tuple(row.target for row in renewed), targets)
+            self.assertTrue(all(row.expires_at == 110 for row in renewed))
+            controller.path_claims.release(owner="one", task_id="one")
+            self.assertEqual(controller.path_claims.list(now=21), ())
+
+    def test_path_claim_corruption_refuses_without_rewriting_evidence(self) -> None:
+        temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="observe-plan")
+        with temporary:
+            store = FleetController(config_path=config_path).path_claims
+            subject = stable_hash(str(repo.resolve()))[:16]
+            target = f"{subject}/.github/workflows/build.yml"
+            store.acquire(owner="one", task_id="one", targets=(target,), ttl_seconds=60, now=10)
+            valid = json.loads(store.path.read_text())[0]
+            missing_expiry = dict(valid)
+            del missing_expiry["expires_at"]
+            damaged = [missing_expiry]
+            damaged.extend({**valid, "target": bad} for bad in (
+                "not-a-repository/.github/file",
+                f"{subject}/../escape",
+                f"{subject}//absolute",
+                f"{subject}/dir\\file",
+                subject,
+            ))
+            operations = (
+                ("list", lambda: store.list(now=11)),
+                ("acquire", lambda: store.acquire(owner="two", task_id="two", targets=(target,), ttl_seconds=60, now=11)),
+                ("renew", lambda: store.renew(owner="one", task_id="one", ttl_seconds=60, now=11)),
+                ("release", lambda: store.release(owner="one", task_id="one")),
+            )
+            for row in damaged:
+                for operation, call in operations:
+                    with self.subTest(row=row, operation=operation):
+                        original = json.dumps([row]).encode()
+                        store.path.write_bytes(original)
+                        with self.assertRaises(ClaimCommandError):
+                            call()
+                        self.assertEqual(store.path.read_bytes(), original)
+
     def git(self, repo: Path, *arguments: str) -> str:
         result = subprocess.run(
             ["git", *arguments],
