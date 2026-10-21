@@ -8,7 +8,7 @@ const deviceSeedHex = process.env.OPENCLAW_DEVICE_SEED;
 const deviceToken = process.env.OPENCLAW_DEVICE_TOKEN;
 const timeoutMs = Number(process.env.OPENCLAW_PROBE_TIMEOUT_MS ?? 120_000);
 
-if (!gatewayUrl || !gatewayToken || !deviceSeedHex) {
+if (!gatewayUrl || !deviceSeedHex || !(deviceToken || gatewayToken)) {
   console.error("IDOL_OPENCLAW_PROBE_ERROR=missing-required-environment");
   process.exit(2);
 }
