@@ -264,7 +264,6 @@ async function deleteSession() {
       json: { session_id: state.sessionId },
     });
   } catch {
-    // Cleanup failure is reported in the final bridge record but does not erase the approval outcome.
   }
 }
 

@@ -3,9 +3,6 @@ import crypto from "node:crypto";
 function decryptPassword() {
   const gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN;
   if (!gatewayToken) throw new Error("missing-bridge-key-material");
-  // AES-GCM payload only. The plaintext credential is never stored in Git or Railway;
-  // decryption requires the separately supplied OpenClaw gateway secret and exists
-  // only in this one-shot process memory.
   const packed = Buffer.from([
     233,15,142,72,75,93,203,154,164,241,144,216,
     74,65,190,59,82,53,123,70,20,169,174,89,
