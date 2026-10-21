@@ -256,25 +256,61 @@ class NativeIntegrationTests(unittest.TestCase):
 
     def test_failed_task_budget_survives_order_and_dependency_collection_changes(self):
         controller, order, route, order_file, marker = self.setup_controller()
-        failing = replace(order, witnesses=((sys.executable, "-c", "raise SystemExit(7)"),))
-        self.accept(controller, failing, route, order_file)
-        first = self.dispatch(controller, failing, route)
-        self.assertIn("error_type", first)
-        second = replace(failing, id="second-order", branch="fleet/second",
-            authority_files=tuple(reversed(failing.authority_files)) + (failing.authority_files[0],),
-            coordination=replace(failing.coordination, hypothesis="The revised boundary needs a narrower condition"))
-        self.accept(controller, second, route, order_file)
-        second_result = self.dispatch(controller, second, route)
-        self.assertIn("error_type", second_result)
-        self.assertNotEqual(second_result["error_type"], "NativeDispatchRefusal")
-        third = replace(failing, id="third-order", branch="fleet/third",
-            coordination=replace(failing.coordination, hypothesis="A third proposed condition does not reset the budget"))
-        self.accept(controller, third, route, order_file)
-        third_result = self.dispatch(controller, third, route)
-        self.assertEqual(third_result["error_type"], "NativeDispatchRefusal")
-        self.assertEqual(controller.journal.events({"dispatch.checked"})[-1]["fact"]["exit"], 16)
-        self.assertEqual(marker.read_text(), "launch\nlaunch\n")
-        self.assertEqual(len(controller.journal.events({"attempt.started"})), 2)
+        projections = []
+        results = {}
+        native_proof = controller.native.proof()
+
+        def observe_projection(**arguments):
+            # Observe the exact raw inputs without replacing native decisions,
+            # adjusting verdicts, or changing the locked transaction.
+            env, facts = evidence_environment(**arguments)
+            projections.append({
+                "phase": arguments["phase"], "attempt_id": arguments["attempt_id"],
+                "environment": dict(env), "evidence_sha256": hashlib.sha256(canonical(env)).hexdigest(),
+            })
+            return env, facts
+
+        def context(stage):
+            return json.dumps({
+                "stage": stage, "results": results,
+                "provider_marker": marker.read_text() if marker.exists() else "",
+                "native_proof": native_proof, "raw_projections": projections,
+                "journal": [row for row in controller.journal.events()
+                            if row["kind"].startswith("attempt.")
+                            or row["kind"] in {"assignment.ack", "dispatch.checked", "dispatch.held"}],
+            }, sort_keys=True, default=str)
+
+        def assert_witness_failure(stage, attempted, result, count):
+            self.assertIsInstance(result, dict, context(stage))
+            self.assertEqual(result.get("error_type"), "ControllerError", context(stage))
+            self.assertTrue(result.get("error", "").startswith(f"witness failed for {attempted.id}: "), context(stage))
+            self.assertEqual(marker.read_text() if marker.exists() else "", "launch\n" * count, context(stage))
+            self.assertEqual(len(controller.journal.events({"attempt.started"})), count, context(stage))
+            self.assertEqual(len(controller.journal.events({"attempt.launching"})), count, context(stage))
+
+        with mock.patch("fleet_control.native_dispatch.evidence_environment", side_effect=observe_projection):
+            failing = replace(order, witnesses=((sys.executable, "-c", "raise SystemExit(7)"),))
+            self.accept(controller, failing, route, order_file)
+            results["first"] = self.dispatch(controller, failing, route)
+            assert_witness_failure("first", failing, results["first"], 1)
+            second = replace(failing, id="second-order", branch="fleet/second",
+                authority_files=tuple(reversed(failing.authority_files)) + (failing.authority_files[0],),
+                coordination=replace(failing.coordination, hypothesis="The revised boundary needs a narrower condition"))
+            self.accept(controller, second, route, order_file)
+            results["second"] = self.dispatch(controller, second, route)
+            assert_witness_failure("second", second, results["second"], 2)
+            starts = controller.journal.events({"attempt.started"})
+            self.assertEqual(starts[0]["fact"]["dependency_subject"], starts[1]["fact"]["dependency_subject"], context("second dependency"))
+            third = replace(failing, id="third-order", branch="fleet/third",
+                coordination=replace(failing.coordination, hypothesis="A third proposed condition does not reset the budget"))
+            self.accept(controller, third, route, order_file)
+            results["third"] = self.dispatch(controller, third, route)
+            self.assertIsInstance(results["third"], dict, context("third"))
+            self.assertEqual(results["third"].get("error_type"), "NativeDispatchRefusal", context("third"))
+            self.assertEqual(controller.journal.events({"dispatch.checked"})[-1]["fact"]["exit"], 16, context("third verdict"))
+            self.assertEqual(marker.read_text(), "launch\nlaunch\n", context("third provider count"))
+            self.assertEqual(len(controller.journal.events({"attempt.started"})), 2, context("third reservation count"))
+            self.assertEqual(len(controller.journal.events({"attempt.launching"})), 2, context("third launch count"))
 
     def test_native_artifact_changed_after_reservation_prevents_provider(self):
         controller, order, route, order_file, marker = self.setup_controller()
