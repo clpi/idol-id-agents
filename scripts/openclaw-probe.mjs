@@ -8,7 +8,7 @@ const deviceSeedHex = process.env.OPENCLAW_DEVICE_SEED;
 const deviceToken = process.env.OPENCLAW_DEVICE_TOKEN;
 const timeoutMs = Number(process.env.OPENCLAW_PROBE_TIMEOUT_MS ?? 120_000);
 
-if (!gatewayUrl || !gatewayToken || !deviceSeedHex) {
+if (!gatewayUrl || !deviceSeedHex || !(deviceToken || gatewayToken)) {
   console.error("IDOL_OPENCLAW_PROBE_ERROR=missing-required-environment");
   process.exit(2);
 }
@@ -164,7 +164,6 @@ function keyPairFromSeed(hex) {
     throw new Error("invalid-device-seed");
   }
   const seed = Buffer.from(hex, "hex");
-  // RFC 8410 PKCS#8 wrapper for a raw 32-byte Ed25519 private seed.
   const prefix = Buffer.from("302e020100300506032b657004220420", "hex");
   const privateKey = crypto.createPrivateKey({
     key: Buffer.concat([prefix, seed]),
@@ -352,7 +351,6 @@ main().catch((error) => {
   try {
     ws.close(1011, "probe-failed");
   } catch {
-    // Ignore close failures during terminal reporting.
   }
   process.exitCode = 1;
 });
