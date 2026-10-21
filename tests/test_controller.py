@@ -21,7 +21,7 @@ from fleet_control.evidence import retain_candidate_evidence
 from fleet_control.gitops import GitRefusal, current_sha
 from fleet_control.health import record_failure
 from fleet_control.model import stable_hash, validate_relative_path
-from fleet_control.runtime import RunResult
+from fleet_control.runtime import RunResult, execution_subject
 from tests.process_helpers import process_stopped
 
 
@@ -447,12 +447,17 @@ class ControllerTests(unittest.TestCase):
         os.environ["IDOL_TEST_CLAIM_LOG"] = str(claim_log)
         try:
             with temporary:
-                result = FleetController(config_path=config_path).run_once()
+                controller = FleetController(config_path=config_path)
+                result = controller.run_once()
                 self.assertEqual(len(result.attempts), 1)
                 attempt = result.attempts[0]
                 self.assertIn("commit", attempt)
                 self.assertEqual(tuple(attempt["paths"]), ("src/ok.txt",))
                 self.assertTrue(Path(attempt["worktree"]).exists())
+                self.assertRegex(attempt["subject_hash"], r"^[0-9a-f]{64}$")
+                bound_rows = controller.journal.events({"attempt.started", "attempt.executed", "attempt.ready"})
+                self.assertEqual(len(bound_rows), 3)
+                self.assertEqual({row["fact"]["subject_hash"] for row in bound_rows}, {attempt["subject_hash"]})
                 log = claim_log.read_text()
                 self.assertIn("acquire", log)
                 self.assertIn("release", log)
@@ -462,6 +467,38 @@ class ControllerTests(unittest.TestCase):
                 os.environ.pop("IDOL_TEST_CLAIM_LOG", None)
             else:
                 os.environ["IDOL_TEST_CLAIM_LOG"] = old
+
+    def test_swapped_dispatch_input_is_held_and_releases_its_claims(self) -> None:
+        temporary, root, repo, state, config, agent, log = self.fixture(mode="apply")
+        with temporary, mock.patch.dict(os.environ, {"IDOL_TEST_CLAIM_LOG": str(log)}):
+            controller = FleetController(config_path=config)
+            execute = controller.runtime.execute
+            captured = {}
+
+            def swap_outcome(**arguments):
+                permit = arguments["attempt_permit"]
+                captured["permit_subject"] = permit.subject_hash
+                captured["actual_subject"] = execution_subject(
+                    order=arguments["order"], route=arguments["route"], attempt_id=permit.attempt_id,
+                    prompt=arguments["prompt_path"].read_bytes(), cwd=arguments["cwd"],
+                )
+                arguments["order"] = replace(arguments["order"], required_outcome="unassigned outcome")
+                return execute(**arguments)
+
+            with mock.patch.object(controller.runtime, "execute", side_effect=swap_outcome):
+                result = controller.run_once()
+            refused = result.attempts[0]
+            self.assertEqual(refused["error_type"], "ExecutionBindingRefusal")
+            self.assertFalse(refused["retryable_route_failure"])
+            self.assertEqual(captured["actual_subject"], captured["permit_subject"])
+            self.assertEqual(refused["subject_hash"], captured["permit_subject"])
+            self.assertEqual((Path(refused["worktree"]) / "src/ok.txt").read_text(), "base\n")
+            self.assertEqual(controller.semantic_claims.list(), ())
+            self.assertEqual(controller.path_claims.list(), ())
+            self.assertIn("acquire ", log.read_text())
+            self.assertIn("release ", log.read_text())
+            self.assertIn("t_controller_1", controller._active_order_ids())
+            self.assertEqual(controller.journal.events({"attempt.executed", "attempt.ready"}), ())
 
     def test_dispatch_revalidates_live_proof_subject_before_claims_or_model(self) -> None:
         temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="apply")

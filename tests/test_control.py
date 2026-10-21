@@ -35,7 +35,7 @@ class LocalControlTests(unittest.TestCase):
 
     def token(self, control: LocalControl, attempt_id: str = "attempt-1"):
         with control.transition_permit("claim") as guard:
-            return guard.issue_attempt_permit(attempt_id)
+            return guard.issue_attempt_permit(attempt_id, subject_hash="a" * 64)
 
     def test_missing_status_is_default_off_and_read_only(self) -> None:
         temporary, _, root, control = self.fixture()
@@ -105,11 +105,11 @@ class LocalControlTests(unittest.TestCase):
         with temporary:
             control.enable(60)
             with control.transition_permit("claim") as guard:
-                token = guard.issue_attempt_permit("owned-attempt")
+                token = guard.issue_attempt_permit("owned-attempt", subject_hash="a" * 64)
                 with self.assertRaises(ControlRefusal):
-                    guard.issue_attempt_permit("owned-attempt")
+                    guard.issue_attempt_permit("owned-attempt", subject_hash="a" * 64)
             with self.assertRaises(ControlRefusal):
-                guard.issue_attempt_permit("late-attempt")
+                guard.issue_attempt_permit("late-attempt", subject_hash="a" * 64)
             with control.transition_permit("worktree", token) as status:
                 self.assertTrue(status.permitted)
             with control.transition_permit("claim", token):
@@ -187,6 +187,25 @@ class LocalControlTests(unittest.TestCase):
             with self.assertRaises(ControlRefusal):
                 with other.transition_permit("process", token):
                     pass
+
+    def test_attempt_subject_is_required_and_authenticated(self) -> None:
+        temporary, _, _, control = self.fixture()
+        with temporary:
+            control.enable(60)
+            with control.transition_permit("claim") as guard:
+                for value in (None, True, "", "a" * 63, "A" * 64, "g" * 64, " " * 64):
+                    with self.subTest(subject_hash=value), self.assertRaises(ValueError):
+                        guard.issue_attempt_permit("invalid-subject", subject_hash=value)
+                token = guard.issue_attempt_permit("bound-attempt", subject_hash="a" * 64)
+            self.assertEqual(token.subject_hash, "a" * 64)
+            for changed in (
+                replace(token, subject_hash="b" * 64),
+                replace(token, subject_hash=""),
+                replace(token, schema="idol.fleet.attempt-permit.v1"),
+            ):
+                with self.subTest(token=changed), self.assertRaises(ControlRefusal):
+                    with control.transition_permit("process", changed):
+                        pass
 
     def test_owned_attempt_survives_enable_expiry_while_new_claims_stop(self) -> None:
         temporary, clock, _, control = self.fixture()

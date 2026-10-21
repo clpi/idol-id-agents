@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -11,12 +13,38 @@ from typing import Any, Mapping
 
 from .model import BillingClass, Route, WorkOrder
 from .policy import assert_order_route
-from .control import AttemptPermit, LocalControl
+from .control import AttemptPermit, ControlRefusal, LocalControl
 from .processes import kill_group_and_reap
 
 
 class RuntimeRefusal(RuntimeError):
     pass
+
+
+class ExecutionBindingRefusal(ControlRefusal):
+    """The requested launch differs from the input admitted with its claims."""
+
+
+def execution_subject(
+    *, order: WorkOrder, route: Route, attempt_id: str, prompt: bytes, cwd: Path,
+) -> str:
+    """Bind physical launch inputs, without interpreting work-order semantics."""
+    order_fields = asdict(order)
+    order_fields["repository"] = str(order.repository)
+    payload = {
+        "schema": "idol.fleet.execution-subject.v1",
+        "order": order_fields,
+        "route_subject": route.subject_hash,
+        # Calibration identity deliberately excludes this actual launch bound.
+        "timeout_seconds": route.timeout_seconds,
+        "attempt_id": attempt_id,
+        "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
+        "cwd": str(cwd),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +257,6 @@ class CommandRuntime:
     def execute(self, *, route: Route, order: WorkOrder, prompt_path: Path, cwd: Path,
                 attempt_permit: AttemptPermit | None = None) -> RunResult:
         assert_order_route(order, route)
-        prompt_text = prompt_path.read_text(encoding="utf-8")
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
@@ -240,21 +267,41 @@ class CommandRuntime:
         ) as usage_handle:
             usage_path = Path(usage_handle.name)
         usage_path.unlink(missing_ok=True)
-        values = {
-            "prompt": str(prompt_path),
-            "prompt_text": prompt_text,
-            "cwd": str(cwd),
-            "model": route.model,
-            "provider": route.provider,
-            "order": order.id,
-            "task": order.task_id,
-            "usage": str(usage_path),
-        }
-        command = [self._format_argument(argument, values) for argument in route.command]
+        # Capture caller-owned input before holding the control lock. The guard
+        # verifies these immutable bytes; the provider never gets the source path.
+        prompt_bytes = prompt_path.read_bytes()
         started_at = time.time()
         process = None
+        prompt_snapshot: Path | None = None
         try:
             with self.control.transition_permit("process", attempt_permit):
+                # The guard authenticates the permit before this binding check.
+                # Both argv forms below use the exact captured and admitted bytes.
+                subject_hash = execution_subject(
+                    order=order, route=route, attempt_id=attempt_permit.attempt_id,
+                    prompt=prompt_bytes, cwd=cwd,
+                )
+                if not hmac.compare_digest(subject_hash, attempt_permit.subject_hash):
+                    raise ExecutionBindingRefusal("execution input differs from the admitted attempt subject")
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", prefix="idol-fleet-prompt-", suffix=".md",
+                    dir=self.state_dir, delete=False,
+                ) as prompt_handle:
+                    prompt_snapshot = Path(prompt_handle.name)
+                    prompt_handle.write(prompt_bytes)
+                    prompt_handle.flush()
+                    os.fsync(prompt_handle.fileno())
+                values = {
+                    "prompt": str(prompt_snapshot),
+                    "prompt_text": prompt_bytes.decode("utf-8"),
+                    "cwd": str(cwd),
+                    "model": route.model,
+                    "provider": route.provider,
+                    "order": order.id,
+                    "task": order.task_id,
+                    "usage": str(usage_path),
+                }
+                command = [self._format_argument(argument, values) for argument in route.command]
                 process = subprocess.Popen(
                     command,
                     cwd=cwd,
@@ -269,6 +316,8 @@ class CommandRuntime:
             if process is not None:
                 kill_group_and_reap(process)
             usage_path.unlink(missing_ok=True)
+            if prompt_snapshot is not None:
+                prompt_snapshot.unlink(missing_ok=True)
             raise
         try:
             stdout, stderr = process.communicate(timeout=route.timeout_seconds)
@@ -282,6 +331,8 @@ class CommandRuntime:
             raise
         finally:
             ended_at = time.time()
+            if prompt_snapshot is not None:
+                prompt_snapshot.unlink(missing_ok=True)
         try:
             if route.parser == "openclaw-json":
                 return self._parse_openclaw(

@@ -45,7 +45,7 @@ from .model import Assignment, Route, WorkOrder, load_routes, mapping, sequence,
 from .policy import assert_order_route
 from .processes import kill_group_and_reap
 from .performance import route_factors
-from .runtime import CommandRuntime, RuntimeRefusal
+from .runtime import CommandRuntime, RuntimeRefusal, execution_subject
 from .scheduler import Plan, Rejection, build_plan
 from .usage import refresh_routes
 
@@ -724,7 +724,7 @@ class FleetController:
         raw.decode("utf-8")
         return f"- `{path}` — SHA-256 `{digest}`, {len(raw)} bytes\n"
 
-    def _prompt(self, assignment: Assignment, worktree: Path) -> Path:
+    def _prompt_text(self, assignment: Assignment, repository: Path) -> str:
         order = assignment.order
         route = assignment.route
         sections = [
@@ -758,13 +758,16 @@ class FleetController:
             "\n## Authority manifest\n",
         ]
         for path in order.authority_files:
-            sections.append(self._authority_section(worktree, path))
+            sections.append(self._authority_section(repository, path))
+        return "".join(sections)
+
+    def _prompt(self, assignment: Assignment, content: bytes) -> Path:
         prompt_dir = self.config.state_dir / "prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path = prompt_dir / f"{order.id}-{int(time.time())}.md"
+        path = prompt_dir / f"{assignment.order.id}-{int(time.time())}.md"
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write("".join(sections))
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         return path
@@ -915,6 +918,11 @@ class FleetController:
         semantic_acquired = False
         paths_acquired = False
         try:
+            prompt_content = self._prompt_text(assignment, self.config.repository).encode("utf-8")
+            subject_hash = execution_subject(
+                order=order, route=route, attempt_id=attempt_id, prompt=prompt_content, cwd=worktree,
+            )
+            fact["subject_hash"] = subject_hash
             with self.control.transition_permit("claim") as admission:
                 self.journal.append("attempt.started", fact)
                 started = True
@@ -925,7 +933,7 @@ class FleetController:
                     ttl_seconds=self.config.claim_ttl_seconds,
                 )
                 semantic_acquired = True
-                attempt_permit = admission.issue_attempt_permit(attempt_id)
+                attempt_permit = admission.issue_attempt_permit(attempt_id, subject_hash=subject_hash)
             with self.control.transition_permit("claim", attempt_permit):
                 self.path_claims.acquire(
                     owner=owner,
@@ -950,7 +958,7 @@ class FleetController:
                         branch=branch,
                         base_sha=order.base_sha,
                     )
-                prompt = self._prompt(assignment, worktree)
+                prompt = self._prompt(assignment, prompt_content)
                 try:
                     result = self.runtime.execute(
                         route=route,
