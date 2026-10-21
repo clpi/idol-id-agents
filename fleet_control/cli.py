@@ -6,11 +6,13 @@ import json
 from pathlib import Path
 import sys
 
-from .calibration import calibrate
+from .calibration import apply_calibration, calibrate, load_calibration, require_current_route_proof
+from .coordination import acknowledge, delegate, load_order, read_regular, recover_delegation, verify_recipe
 from .controller import load_config
 from .control import LocalControl
 from .manager import ManagedFleetController
 from .performance import load_receipt, record_outcome
+from .policy import assert_order_route
 
 
 def _json(value) -> str:
@@ -46,6 +48,22 @@ def parser() -> argparse.ArgumentParser:
     outcome = commands.add_parser("record-outcome", help="append one independently reviewed terminal outcome")
     outcome.add_argument("--receipt", required=True, type=Path)
 
+    ack = commands.add_parser("acknowledge", help="explicitly accept one exact assignment and calibrated route")
+    ack.add_argument("--work-order", required=True, type=Path)
+    ack.add_argument("--recipient", required=True)
+    ack.add_argument("--route", required=True)
+    ack.add_argument("--ttl-seconds", type=int, default=3600)
+
+    delegation = commands.add_parser("delegate", help="journal parent provenance and publish one exact child order")
+    delegation.add_argument("--parent-order", type=Path)
+    delegation.add_argument("--child-order", type=Path)
+    delegation.add_argument("--owner")
+    delegation.add_argument("--recover-event", help="republish the exact child recorded by an interrupted delegation")
+
+    recipe = commands.add_parser("verify-recipe", help="run explicit local controls and retain raw recipe evidence")
+    recipe.add_argument("--work-order", required=True, type=Path)
+    recipe.add_argument("--spec", required=True, type=Path)
+
     return root
 
 
@@ -72,6 +90,52 @@ def main(argv: list[str] | None = None) -> int:
 
         mode = getattr(args, "mode", None)
         controller = ManagedFleetController(config_path=args.config, mode_override=mode)
+        if args.command in {"acknowledge", "verify-recipe", "delegate"}:
+            def configured_order(path):
+                order = load_order(path)
+                if order.repository.resolve() != controller.config.repository.resolve():
+                    raise ValueError("work order belongs to a different controller repository")
+                return order
+
+            if args.command == "acknowledge":
+                order = configured_order(args.work_order)
+                routes = apply_calibration(
+                    routes=controller.config.routes, record=load_calibration(controller.config.calibration_file),
+                    raw_config=controller.raw_config,
+                )
+                route = next((route for route in routes if route.id == args.route), None)
+                if route is None or not route.enabled:
+                    raise ValueError("ACK requires an enabled, currently calibrated named route")
+                require_current_route_proof(route)
+                assert_order_route(order, route)
+                row = acknowledge(
+                    journal=controller.journal, order=order, route=route,
+                    recipient=args.recipient, ttl_seconds=args.ttl_seconds,
+                )
+            elif args.command == "verify-recipe":
+                specification = json.loads(read_regular(args.spec, maximum=1024 * 1024))
+                if not isinstance(specification, dict):
+                    raise ValueError("recipe specification must be an object")
+                row = verify_recipe(
+                    journal=controller.journal, control=controller.control,
+                    order=configured_order(args.work_order), specification=specification,
+                )
+            elif args.recover_event:
+                if any((args.parent_order, args.child_order, args.owner)):
+                    raise ValueError("recover-event cannot change an existing delegation")
+                row = recover_delegation(
+                    journal=controller.journal, work_orders_dir=controller.config.work_orders_dir,
+                    event=args.recover_event,
+                )
+            else:
+                if not all((args.parent_order, args.child_order, args.owner)):
+                    raise ValueError("delegate requires parent-order, child-order, and owner")
+                row = delegate(
+                    journal=controller.journal, work_orders_dir=controller.config.work_orders_dir,
+                    parent=configured_order(args.parent_order), child=configured_order(args.child_order), owner=args.owner,
+                )
+            print(_json(row))
+            return 0
         if args.command == "record-outcome":
             receipt = load_receipt(args.receipt)
             row = record_outcome(

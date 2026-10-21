@@ -44,7 +44,7 @@ Each cycle:
 7. validate edited paths, run witnesses, commit explicit claimed paths, optionally publish a draft handoff, and release claims;
 8. leave acceptance to an independent reviewer and IDOL’s normal admission gates.
 
-Runtime refusals open a per-route circuit for 5 minutes, then 15 minutes, then 1 hour, capped at 6 hours. A successful bounded run resets that circuit. Exhausted allowance disables only that route, so the same immutable work order remains eligible for another calibrated provider on the next cycle. Reviewed outcomes feed a bounded productivity factor into routing; unreviewed token volume never counts as progress.
+Runtime refusals open a per-route circuit for 5 minutes, then 15 minutes, then 1 hour, capped at 6 hours. A successful bounded run resets that circuit. Exhausted allowance disables only that route. A subsequent attempt still needs the native task budget and a fresh recipient ACK for its exact assignment and selected route; a route fallback cannot silently transfer that acceptance. Reviewed outcomes feed a bounded productivity factor into routing; unreviewed token volume never counts as progress.
 
 Allowed no-change evidence is reviewable only when its stdout is complete and nonempty. The controller stores the exact bounded bytes in a mode-0600 file beneath a mode-0700 `candidate-evidence` state directory, then journals only `{path, sha256, size_bytes}`. The ready fact sets `no_change: true`, uses the exact base SHA as its candidate commit, and keeps `paths` empty. Outcome recording reopens the artifact without following its final path, validates its private mode, owner, stable file identity, digest, and size, and binds every terminal verdict to that digest. This protects against ordinary drift; it is not an attestation against malicious root replacement.
 
@@ -92,7 +92,7 @@ Enable leases last 30 seconds to 24 hours. Expiry stops new admission; refresh i
 
 The control lock brackets local claim mutations, repository-claim acquire/renew launches, worktree creation, provider and witness launches, and finalization mutations and readiness. Disable linearizes against those operations: a launch that wins the lock has already started; a disable that wins prevents it. The lock is released immediately after a provider or claim-command process starts. Already-started child operations may complete; later boundaries recheck the current control. Witness launches are checked too, and claim cleanup remains available after disable. This is an admission kill switch, not retroactive termination of an already-launched process.
 
-Attempt permits use `idol.fleet.attempt-permit.v2` and authenticate a `subject_hash` in addition to the attempt identity and control epoch. Before the first claim, the controller renders the prompt from the exact authority checkout and computes a versioned SHA-256 subject over every `WorkOrder` field, the existing route subject hash, the actual route timeout, the attempt ID, the intended worktree path, and the exact prompt-byte digest. The route subject remains the existing calibration identity; because it excludes `timeout_seconds`, the launch subject binds that execution limit separately. Auth environment secret values are not serialized. The existing `attempt.started`, `attempt.executed`, and terminal journal records carry this digest; there is no additional identity registry. A v1 or unbound permit cannot authorize a provider launch.
+Attempt permits use `idol.fleet.attempt-permit.v2` and authenticate a `subject_hash` in addition to the attempt identity and control epoch. Before the first claim, the controller renders the prompt from the exact authority checkout and computes the `idol.fleet.execution-subject.v2` SHA-256 subject over every `WorkOrder` field (including the frozen coordination declaration), the existing route subject hash, the actual route timeout, the attempt ID, the intended worktree path, the exact prompt-byte digest, and the complete native calibration proof. The route subject remains the existing calibration identity; because it excludes `timeout_seconds`, the launch subject binds that execution limit separately. Auth environment secret values are not serialized. The existing `attempt.started`, `attempt.launching`, `attempt.executed`, and terminal journal records carry this digest; there is no additional identity registry. A v1 or unbound permit cannot authorize a provider launch.
 
 The runtime recomputes that subject inside the existing process guard immediately before `Popen`. A changed order, scope, role, witness, outcome, route subject, timeout, attempt, prompt, or working directory raises `ExecutionBindingRefusal`, preserves the diagnostic worktree, releases this attempt's claims, and holds the order without automatic provider fallback. The runtime captures prompt bytes once before taking the control lock, then verifies those immutable bytes inside the guard. `{prompt_text}` receives their UTF-8 decoding, and `{prompt}` receives a private 0600 temporary snapshot of the same bytes, removed when the bounded process finishes or refuses. Rewriting the original prompt file after capture cannot change those arguments. The snapshot and local permit remain within the private-account trust boundary; they do not defend against a same-UID or root actor changing trusted process memory, binaries, snapshot files, or control keys. This binding authenticates physical execution inputs and does not establish semantic admission, distributed claims, or compute isolation.
 
@@ -114,17 +114,148 @@ Every enabled route must list its configured regular-file proof subjects in `pro
 
 If one proof fails, independently current routes remain eligible. Failed routes retry after 5 minutes, 15 minutes, 1 hour, then 6 hours; deferred cycles continue observing and planning without repeating refusal events. If every proof fails, apply completes with all routes disabled and performs no claim or model action. Recovery is journaled when a fresh proof succeeds. This is an operational filesystem-drift detector, not an attestation against malicious root-level ABA replacement or unlisted transitive dependencies.
 
-Use `idol-fleet --config ... record-outcome --receipt ...` to append an independently reviewed terminal outcome. Ready attempts remain held for review, and all non-runtime refusals remain held for operator diagnosis. Only a bounded runtime refusal is eligible for automatic provider fallback.
+Use `idol-fleet --config ... record-outcome --receipt ...` to append an independently reviewed terminal outcome. Ready attempts remain held for review, including when a differently named order or another route proposes the same task. Native refusals retain `dispatch.held` evidence and never trigger provider fallback. After diagnosis, an explicit fresh ACK can make a held order eligible for another native decision; it does not erase history or grant another attempt.
 
 The bootstrap adapter is temporary. Its deletion witness is a LIVE runtime capable of observing the same facts, producing the same proposals, enforcing the same claims and route proofs, and emitting the same append-only attempt history without Python owning collaboration semantics.
 
-### Open coordination and native-admission integration
+### Native dispatch and explicit coordination
 
-The controller does not yet implement explicit `execute`/`deliberate` reasoning modes, parent/child delegation admission, or a native dispatch gate. The permit binding above does not complete those capabilities. The existing coordination policy and work-order shape remain owned by [IDOL PR #470](https://github.com/clpi/idol/pull/470); [agents PR #34](https://github.com/clpi/idol-id-agents/pull/34) owns its separate Slack intake work. Reasoning modes are distinct from compiler generations S1/B and S2/C.
+Apply now requires the canonical LIVE law at `coordination/dispatch.id`, compiled directly and qualified by LIVE's `tests/dispatch.py`. This repository transports raw facts and enforces physical process boundaries; it contains no copied native policy and no Python mode, recipe, ACK, or retry evaluator. The coordination policy and work-order ownership in [IDOL PR #470](https://github.com/clpi/idol/pull/470), the separate Slack intake in [agents PR #34](https://github.com/clpi/idol-id-agents/pull/34), and LIVE's post-execution `admit` gate retain their roles.
 
-The native owner can consume raw work-order evidence at two existing seams: inside the first `transition_permit("claim")` before `attempt.started`, and inside the runtime's guarded provider launch. A future contract must bind the immutable work order and route to the attempt while allowing phase-specific raw claim and journal evidence to change after acquisition. It must carry explicit mode, acknowledged owner and exact scope, parent work-record provenance, recipe/control/verifier evidence or a bounded deliberation question and exit artifact, dependency identity, attempt history, and the existing recovery owner. Native code must evaluate that evidence; a Python-produced exclusivity or admission boolean is not a substitute. Missing or refused native evidence must prevent launch without turning into automatic provider fallback. LIVE's post-execution `admit` gate is not a dispatch permit.
+The law decides legality twice. Under the existing control lock and the existing journal's exclusive transaction, `reserve` must return exit zero before `attempt.started` and before claim acquisition. After both local claim stores and the repository claim adapter have succeeded, `launch` rechecks fresh raw evidence inside the provider process guard. It must return zero before the controller durably appends `attempt.launching` and calls `Popen`. A failed process creation still consumes that reservation; replaying the permit cannot create another provider. All paths acquire locks in control-then-journal order. Compilation and control qualification happen beforehand, outside admission locks.
 
-Delegated children must enter through the existing work-order, claim, and dispatch path. Parent provenance does not exempt overlapping claims: a parent holding an umbrella scope must hand it off or release it before a child owns a descendant scope. Current claims are local to their configured authority, and raw claim snapshots do not replace locked acquisition. These remaining native, delegation, and mode requirements need their owner's executable positive, negative, mutation, and exact-subject witnesses before they can be reported as implemented.
+The gate's verdict is only its actual exit code. Missing configuration, stale proof, missing evidence, timeout, nonzero exit, or changed native bytes holds the assignment. The controller never supplies `exclusive=true`, `ack=true`, or a precomputed semantic verdict. Hierarchical semantic and path claims, repository-owned claims, route billing proofs, disable/drain, bounded worktrees, witnesses, and independent outcome review remain necessary.
+
+#### Pin and calibrate the native artifact
+
+Add `native_dispatch` to the same private controller configuration. This is an inert template: substitute a reviewed full LIVE commit and the SHA-256 of the actual direct-capable compiler executable installed on that host. Keep `mode` at `observe-plan` and existing routes disabled during preparation.
+
+```json
+{
+  "mode": "observe-plan",
+  "native_dispatch": {
+    "live_repository": "/absolute/reviewed/idol-live",
+    "live_revision": "REPLACE_WITH_REVIEWED_40_HEX_LIVE_COMMIT",
+    "source_sha256": "02b0203d0affe7b7470826f911ef2fffd4f1fad3b202ed5aeadf1332e9336e24",
+    "controls_sha256": "2751b922c90cad715dcccd1f60759fe354424a2b5c18c40601f7d8cccc6f9a8d",
+    "compiler": "/absolute/reviewed/idol-compiler",
+    "compiler_sha256": "REPLACE_WITH_ACTUAL_64_HEX_COMPILER_SHA256"
+  }
+}
+```
+
+These source/control digests name this candidate's exact native contract; the LIVE revision must contain those exact blobs. A changed law, harness, compiler, configuration, or filesystem subject requires fresh calibration. Resolve an intended compiler symlink to its regular target before configuring it. The compiler pin is host-specific; a C-emitting test toolchain is not evidence that a direct binary can execute there.
+
+```sh
+idol-fleet --config /absolute/fleet.json calibrate
+```
+
+Calibration checks both blobs against the pinned Git revision and requires the checkout HEAD to equal that revision. It runs `idol compile --backend=direct --no-cache`, then the unchanged canonical control harness against those produced bytes. Git observations are bounded to ten seconds each, compilation to ninety seconds, and the control harness to sixty seconds. No C backend or adapter fallback is selected. A missing direct-capable realization fails calibration.
+
+The existing calibration record stores the source, harness, compiler, binary fingerprints, direct backend selection and resulting artifact, and complete control summary. The binary is retained under the existing private state directory at `native-dispatch/<sha256>.bin`. Admission and launch recheck the proof and artifact identity, and authenticate the proof digest in the execution permit. A harness's label on an externally supplied binary does not establish its backend; the actual direct compilation step and matching bytes are required too.
+
+Legacy orders remain readable in observation and planning. They cannot apply until the owner adds a coordination declaration, selects current native evidence, and the recipient explicitly accepts the resulting exact assignment. There is no migration that fabricates acceptance for already queued work. Do not rename a stable task to obtain a new retry allowance.
+
+#### Declare a mode and obtain a recipient ACK
+
+Every applying WorkOrder carries a frozen `coordination` object. For example, a bounded deliberation can add:
+
+```json
+{
+  "coordination": {
+    "mode": "deliberate",
+    "recipient": "compiler-worker",
+    "parent_task": "",
+    "parent_subject": "",
+    "hypothesis": "The failing witness comes from an incomplete boundary check",
+    "attempts": 2,
+    "allowance": 900,
+    "recovery": "compiler-coordinator",
+    "question": "Which exact boundary change satisfies the supplied witnesses?",
+    "artifact": "evidence/boundary-analysis.md",
+    "recipe": "",
+    "prerequisites": []
+  }
+}
+```
+
+The full order must also claim its output paths and supply witnesses for the required outcome. A `deliberate` assignment needs a concrete question, a relative exit-artifact path, and a named recovery owner. Question and hypothesis text must be canonical printable ASCII, with no leading, trailing, or repeated spaces; the adapter does not silently rewrite either. The runtime must actually produce that artifact; its observed digest and size enter the journal before the normal witnesses and review. An `execute` assignment needs a selected recipe receipt from actual positive and negative controls, as described below. These operational modes correspond to the explicit execution and deliberation split; they are distinct from compiler generations S1/B and S2/C. Declaring a mode does not prove the quality or effectiveness of an agent's thinking.
+
+Native policy limits each task to one or two attempts for unchanged dependency evidence. The second needs a different explicit hypothesis. Order names, route changes, and communication channels do not reset the journal's stable-task history. The dependency subject contains the exact base, sorted unique authority paths and their actual base bytes, and sorted admitted prerequisite receipt identities. ACKs, delegation receipts, and recipe receipts cannot become caller-selected reset tokens. A running or ready attempt holds the task; a ready result needs an independent terminal outcome first. History overflow beyond the 32-slot native projection holds rather than dropping older attempts.
+
+The actual recipient invokes the existing CLI using the exact finalized order and selected calibrated route:
+
+```sh
+idol-fleet --config /absolute/fleet.json acknowledge \
+  --work-order /absolute/work-order.json \
+  --recipient compiler-worker --route calibrated-route --ttl-seconds 3600
+```
+
+This appends `assignment.ack` in the existing journal. Its subject binds the complete WorkOrder, path and semantic scope, exact base, mode, recipient, parent, dependency, and physical route identity including timeout. The receipt records the actual local UID, source `local-cli`, route/provider/model, acceptance time, and expiry. A later revision or route transfer requires explicit new acceptance. Each ACK can reserve one attempt. The adapter does not infer ACK from queue delivery, a matching caller string, or provider startup.
+
+#### Delegate through the existing queue
+
+A parent first needs explicit acceptance of its current declaration. Construct the child with a distinct task and responsibility, exact path and semantic claims, a recipient, and `parent_task` plus `parent_subject` equal to the parent's task and `assignment_subject` in its ACK receipt. Then the accepted parent recipient invokes:
+
+```sh
+idol-fleet --config /absolute/fleet.json delegate \
+  --parent-order /absolute/parent.json --child-order /absolute/child.json \
+  --owner compiler-coordinator
+idol-fleet --config /absolute/fleet.json acknowledge \
+  --work-order /absolute/state/work-orders/child-order.json \
+  --recipient child-worker --route calibrated-route
+```
+
+The delegation owner must equal the parent's declared recipient; use that recipient's actual name in the command. `assignment.delegated` records the exact parent acceptance and full child bytes before the atomic queue publication. `assignment.queued` follows publication. A crash leaves recoverable intent, never an unjournaled child. Retry with the same child is idempotent; different existing queue bytes are never overwritten. Recover an interrupted publication with `delegate --recover-event <assignment.delegated hash>`. After the parent explicitly renews its ACK, re-delegating appends fresh provenance while preserving identical child queue bytes.
+
+Native dispatch checks the child receipt, parent owner and acceptance freshness, and the child's own ACK. Children use the ordinary work-order, claim, and dispatch path. A parent holding an umbrella claim must transfer or release that responsibility before a child can acquire an overlapping descendant claim; parent provenance provides no overlap exemption. The queue and journal are the implemented local communication path. This change does not duplicate Slack intake or promise delivery through unimplemented external channels.
+
+#### Produce recipe evidence for execute mode
+
+Finalize an `execute` order with its intended recipient, goal, scope, witnesses, parent, hypothesis, and budget, leaving only `coordination.recipe` empty. A trusted local verifier supplies a JSON specification containing bounded argv controls, expected exits, a recipe identifier, verifier identity, and a relative artifact path. For example:
+
+```json
+{
+  "id": "boundary-repair",
+  "verifier": "independent-verifier",
+  "artifact": "evidence/recipe.json",
+  "timeout_seconds": 60,
+  "positive": {
+    "command": ["python3", "tests/positive_boundary.py"],
+    "expected_exit": 0
+  },
+  "negative": {
+    "command": ["python3", "tests/damaged_boundary.py"],
+    "expected_exit": 7
+  }
+}
+```
+
+The named scripts and artifact must exist or be produced in the exact-base checkout; these are explanatory names, not installed controls. Run the explicit producer only after the existing maintenance control permits this trusted command execution:
+
+```sh
+idol-fleet --config /absolute/fleet.json verify-recipe \
+  --work-order /absolute/execute-order.json --spec /absolute/recipe-spec.json
+```
+
+The producer creates a private exact-base checkout, runs both actual controls with bounded process groups, and retains commands, outputs, observed exits, and artifact bytes. It journals `recipe.observed` even when the expected and actual exits disagree. It does not accept an imported `verified` boolean. Disable/drain is checked under the maintenance guard at every process launch; interruption retains evidence. The native law requires a distinct verifier, matching zero positive exit, matching nonzero negative exit, distinct controls, current artifact bytes, and exact task, scope, base, dependency, and premise bindings.
+
+Copy the returned journal event `hash` into that order's `coordination.recipe`, then obtain the recipient's fresh ACK using `acknowledge`. The recipe premise hashes the entire WorkOrder with only that receipt reference cleared, so changing the goal, witness, mode, owner, or budget requires new evidence. Recipe receipts never enter their own dependency hash. The CLI deliberately does not rewrite queued orders or fabricate ACKs after verification.
+
+#### Verification and trust boundary
+
+`python3 -m unittest discover -s tests -v` exercises the existing physical controller and new producers/transactions. Existing physical tests use an explicitly test-only native port to isolate claims and control timing; they do not prove native policy. The required direct integration entrypoint is:
+
+```sh
+python3 tests/native_dispatch_integration.py \
+  --live /absolute/pinned/idol-live --compiler /absolute/pinned/idol
+```
+
+It compiles the canonical law once, runs its raw controls, then exercises the real controller, recipient ACK, parent/child queue, actual recipe controls, concurrent reservation, replay refusal, ready-task hold, changed artifacts, and a deliberate decision-boundary bypass against a harmless provider sentinel. It never skips or substitutes a C realization. Separately labeled C prequalification cannot qualify deployment.
+
+ACK and verifier identity currently rely on explicit trusted invocation by the local account. The recorded UID and selected route do not cryptographically prove a remote agent's identity; sharing that UID shares this trust boundary. Recipe commands are trusted local code in an isolated checkout, not OS-confined programs. They can access what that account can access. Owned process groups are ended before evidence is accepted, even after a successful leader exit; descendants deliberately creating new sessions require stronger OS confinement. Source and artifact checks detect ordinary drift; they are not protection against a same-UID or root actor replacing all trusted state or changing process memory.
+
+Task histories are complete within this journal for the supplied stable task ID. Canonical cross-host task identity, authenticated remote ACK transport, distributed atomic claims, and Ocean/Lake isolation receipts require their respective authorities and deployed producers. This adapter does not infer semantic task equivalence from different caller-selected IDs, synchronize independent journals, establish fleet-wide atomic compute, or replace post-execution admission. Production enablement still requires direct controls on the actual deployment host, current route and authority proofs, explicit local control, and the existing deployment checks.
 
 ## Linux service identity
 

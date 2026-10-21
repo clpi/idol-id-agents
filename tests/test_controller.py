@@ -23,9 +23,17 @@ from fleet_control.health import record_failure
 from fleet_control.model import stable_hash, validate_relative_path
 from fleet_control.runtime import RunResult, execution_subject
 from tests.process_helpers import process_stopped
+from tests.native_transport_fixture import TransportOnlyGate
 
 
 class ControllerTests(unittest.TestCase):
+    def setUp(self):
+        # These existing tests exercise claims, containment, and control timing.
+        # Actual native-policy integration has its own required direct entrypoint.
+        gate = mock.patch("fleet_control.controller.NativeDispatcher", TransportOnlyGate)
+        gate.start()
+        self.addCleanup(gate.stop)
+
     def test_path_claim_lifecycle_preserves_exact_paths_and_semantic_domain(self) -> None:
         temporary, root, repo, state, config_path, agent, claim_log = self.fixture(mode="observe-plan")
         with temporary:
@@ -481,6 +489,7 @@ class ControllerTests(unittest.TestCase):
                 captured["actual_subject"] = execution_subject(
                     order=arguments["order"], route=arguments["route"], attempt_id=permit.attempt_id,
                     prompt=arguments["prompt_path"].read_bytes(), cwd=arguments["cwd"],
+                    native_subject=controller.native.subject(),
                 )
                 arguments["order"] = replace(arguments["order"], required_outcome="unassigned outcome")
                 return execute(**arguments)

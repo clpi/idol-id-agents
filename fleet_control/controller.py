@@ -21,6 +21,7 @@ from .calibration import (
 )
 from .claims import ControllerLease, RepositoryClaimTransaction, SemanticClaimStore
 from .control import ControlRefusal, LocalControl
+from .coordination import CoordinationError, local_path, read_regular
 from .evidence import retain_candidate_evidence
 from .gitops import (
     GitRefusal,
@@ -46,6 +47,7 @@ from .policy import assert_order_route
 from .processes import kill_group_and_reap
 from .performance import route_factors
 from .runtime import CommandRuntime, RuntimeRefusal, execution_subject
+from .native_dispatch import NativeDispatcher, NativeDispatchRefusal
 from .scheduler import Plan, Rejection, build_plan
 from .usage import refresh_routes
 
@@ -200,7 +202,8 @@ class FleetController:
             target_validator=self._validate_path_claim_target,
         )
         self.control = LocalControl(self.config.state_dir / "control")
-        self.runtime = CommandRuntime(self.config.state_dir / "runtime", control=self.control)
+        self.native = NativeDispatcher(raw_config=self.raw_config, calibration_file=self.config.calibration_file, journal=self.journal)
+        self.runtime = CommandRuntime(self.config.state_dir / "runtime", control=self.control, native=self.native)
         self.lease_path = self.config.state_dir / "controller.lock"
 
     @staticmethod
@@ -604,6 +607,8 @@ class FleetController:
                 "attempt.admitted",
                 "attempt.rejected",
                 "attempt.reverted",
+                "dispatch.held",
+                "assignment.ack",
             }
         ):
             fact = row.get("fact")
@@ -613,7 +618,10 @@ class FleetController:
             if not isinstance(order_id, str):
                 continue
             kind = str(row.get("kind"))
-            if kind == "attempt.refused" and fact.get("retryable_route_failure") is True:
+            if kind == "assignment.ack":
+                if state.get(order_id) in {"dispatch.held", "attempt.refused", "attempt.failed", "attempt.cancelled", "attempt.rejected"}:
+                    state[order_id] = "acknowledged"
+            elif kind == "attempt.refused" and fact.get("retryable_route_failure") is True:
                 state[order_id] = "retryable"
             else:
                 state[order_id] = kind
@@ -627,6 +635,7 @@ class FleetController:
             "attempt.no-change",
             "attempt.rejected",
             "attempt.reverted",
+            "dispatch.held",
         }
         return frozenset(order_id for order_id, kind in state.items() if kind in held)
 
@@ -736,6 +745,11 @@ class FleetController:
             f"Role: `{order.role}`\n",
             f"Route identity: `{route.provider}/{route.model}` via `{route.runtime}`\n",
             f"Required outcome: {order.required_outcome}\n",
+            *([
+                "\n## Accepted coordination declaration\n",
+                json.dumps(asdict(order.coordination), sort_keys=True, indent=2) + "\n",
+                "Use the declared mode, question, allowance, recovery owner, and exit artifact. A child assignment needs explicit delegation and its own recipient acknowledgement before it can run.\n",
+            ] if order.coordination is not None else []),
             "\n## Non-negotiable boundaries\n",
             "- Treat the authority manifest and the checked-out exact SHA as the subject. Read each named authority file from this worktree before editing; do not substitute memory or another checkout.\n",
             "- Acquire no new path or semantic scope.\n",
@@ -919,13 +933,20 @@ class FleetController:
         paths_acquired = False
         try:
             prompt_content = self._prompt_text(assignment, self.config.repository).encode("utf-8")
+            native_subject = self.native.subject()
             subject_hash = execution_subject(
                 order=order, route=route, attempt_id=attempt_id, prompt=prompt_content, cwd=worktree,
+                native_subject=native_subject,
             )
             fact["subject_hash"] = subject_hash
             with self.control.transition_permit("claim") as admission:
-                self.journal.append("attempt.started", fact)
-                started = True
+                with self.journal.transaction() as transaction:
+                    fact.update(self.native.decide(
+                        phase="reserve", order=order, route=route, attempt_id=attempt_id,
+                        transaction=transaction, native_subject=native_subject,
+                    ))
+                    transaction.append("attempt.started", fact)
+                    started = True
                 self.semantic_claims.acquire(
                     owner=owner,
                     task_id=order.task_id,
@@ -976,6 +997,12 @@ class FleetController:
                     )
                     raise
                 record_success(self.journal, route)
+                if order.coordination is not None and order.coordination.artifact:
+                    exit_content = read_regular(local_path(worktree, order.coordination.artifact))
+                    self.journal.append("attempt.exit-artifact", {
+                        **fact, "path": order.coordination.artifact,
+                        "sha256": hashlib.sha256(exit_content).hexdigest(), "bytes": len(exit_content),
+                    })
                 stdout_bytes = result.stdout.encode("utf-8")
                 stdout_hash = hashlib.sha256(stdout_bytes).hexdigest()
                 self.journal.append(
@@ -1097,6 +1124,10 @@ class FleetController:
                     self.journal.append("attempt.ready", ready)
                 return ready
         except Exception as exc:
+            if isinstance(exc, (NativeDispatchRefusal, CoordinationError)) and not started:
+                held = {**fact, "error_type": type(exc).__name__, "error": str(exc), "retryable_route_failure": False}
+                self.journal.append("dispatch.held", held)
+                return held
             if isinstance(exc, ControlRefusal) and not started:
                 return None
             refused = {

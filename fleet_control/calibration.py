@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import os
@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 
 from . import __version__
 from .model import BillingClass, BillingProof, ProofSubjectError, Route, stable_hash
+from .native_dispatch import NativeDispatchRefusal, calibrate_native
 from .scheduler import path_overlap, semantic_overlap
 
 
@@ -44,6 +45,7 @@ class CalibrationRecord:
     routes: Mapping[str, Mapping[str, Any]]
     route_refusals: Mapping[str, str]
     controls: Mapping[str, bool]
+    native_dispatch: Mapping[str, Any] = field(default_factory=dict)
 
     def valid(self, *, config_hash: str, now: float | None = None) -> bool:
         current = time.time() if now is None else now
@@ -222,6 +224,13 @@ def calibrate(
             f"calibration produced no enabled route proof: {detail}",
             route_refusals=refusals,
         )
+    try:
+        native_proof = calibrate_native(
+            raw_config=raw_config, state_dir=Path(output).parent,
+            observed_at=current, expires_at=current + ttl_seconds,
+        )
+    except NativeDispatchRefusal as exc:
+        raise CalibrationError(str(exc), route_refusals=refusals) from exc
     record = CalibrationRecord(
         version="idol.fleet.calibration.v1",
         config_hash=config_hash(raw_config),
@@ -231,6 +240,7 @@ def calibrate(
         routes=proofs,
         route_refusals=refusals,
         controls=controls,
+        native_dispatch=native_proof,
     )
     path = Path(output).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -273,6 +283,7 @@ def load_calibration(path: Path) -> CalibrationRecord:
                 for key, value in mapping_or_empty(raw.get("route_refusals")).items()
             },
             controls={str(key): value is True for key, value in controls.items()},
+            native_dispatch=mapping_or_empty(raw.get("native_dispatch")),
         )
     except (TypeError, ValueError, OverflowError) as exc:
         raise CalibrationError("calibration record has malformed scalar facts") from exc
