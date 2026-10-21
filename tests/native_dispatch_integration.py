@@ -258,7 +258,7 @@ class NativeIntegrationTests(unittest.TestCase):
         controller, order, route, order_file, marker = self.setup_controller()
         projections = []
         results = {}
-        native_proof = controller.native.proof()
+        stage = "first"
 
         def observe_projection(**arguments):
             # Observe the exact raw inputs without replacing native decisions,
@@ -266,51 +266,82 @@ class NativeIntegrationTests(unittest.TestCase):
             env, facts = evidence_environment(**arguments)
             projections.append({
                 "phase": arguments["phase"], "attempt_id": arguments["attempt_id"],
-                "environment": dict(env), "evidence_sha256": hashlib.sha256(canonical(env)).hexdigest(),
+                "environment": dict(env),
             })
             return env, facts
 
         def context(stage):
-            return json.dumps({
+            diagnostic = {
                 "stage": stage, "results": results,
-                "provider_marker": marker.read_text() if marker.exists() else "",
-                "native_proof": native_proof, "raw_projections": projections,
-                "journal": [row for row in controller.journal.events()
-                            if row["kind"].startswith("attempt.")
-                            or row["kind"] in {"assignment.ack", "dispatch.checked", "dispatch.held"}],
-            }, sort_keys=True, default=str)
+                "raw_projections": [
+                    {**row, "evidence_sha256": hashlib.sha256(canonical(row["environment"])).hexdigest()}
+                    for row in projections
+                ],
+            }
+            for name, read in (
+                ("provider_marker", lambda: marker.read_text() if marker.exists() else ""),
+                ("native_proof", controller.native.proof),
+                ("journal", lambda: [row for row in controller.journal.events()
+                                     if row["kind"].startswith("attempt.")
+                                     or row["kind"] in {"assignment.ack", "dispatch.checked", "dispatch.held"}]),
+            ):
+                try:
+                    diagnostic[name] = read()
+                except Exception as exc:
+                    diagnostic[name] = {"diagnostic_error_type": type(exc).__name__, "diagnostic_error": str(exc)}
+            return json.dumps(diagnostic, sort_keys=True, default=str)
 
-        def assert_witness_failure(stage, attempted, result, count):
-            self.assertIsInstance(result, dict, context(stage))
-            self.assertEqual(result.get("error_type"), "ControllerError", context(stage))
-            self.assertTrue(result.get("error", "").startswith(f"witness failed for {attempted.id}: "), context(stage))
-            self.assertEqual(marker.read_text() if marker.exists() else "", "launch\n" * count, context(stage))
-            self.assertEqual(len(controller.journal.events({"attempt.started"})), count, context(stage))
-            self.assertEqual(len(controller.journal.events({"attempt.launching"})), count, context(stage))
+        def assert_witness_failure(attempted, result):
+            self.assertIsInstance(result, dict)
+            self.assertEqual(result.get("error_type"), "ControllerError")
+            self.assertTrue(result.get("error", "").startswith(f"witness failed for {attempted.id}: "))
 
-        with mock.patch("fleet_control.native_dispatch.evidence_environment", side_effect=observe_projection):
-            failing = replace(order, witnesses=((sys.executable, "-c", "raise SystemExit(7)"),))
-            self.accept(controller, failing, route, order_file)
-            results["first"] = self.dispatch(controller, failing, route)
-            assert_witness_failure("first", failing, results["first"], 1)
-            second = replace(failing, id="second-order", branch="fleet/second",
-                authority_files=tuple(reversed(failing.authority_files)) + (failing.authority_files[0],),
-                coordination=replace(failing.coordination, hypothesis="The revised boundary needs a narrower condition"))
-            self.accept(controller, second, route, order_file)
-            results["second"] = self.dispatch(controller, second, route)
-            assert_witness_failure("second", second, results["second"], 2)
-            starts = controller.journal.events({"attempt.started"})
-            self.assertEqual(starts[0]["fact"]["dependency_subject"], starts[1]["fact"]["dependency_subject"], context("second dependency"))
-            third = replace(failing, id="third-order", branch="fleet/third",
-                coordination=replace(failing.coordination, hypothesis="A third proposed condition does not reset the budget"))
-            self.accept(controller, third, route, order_file)
-            results["third"] = self.dispatch(controller, third, route)
-            self.assertIsInstance(results["third"], dict, context("third"))
-            self.assertEqual(results["third"].get("error_type"), "NativeDispatchRefusal", context("third"))
-            self.assertEqual(controller.journal.events({"dispatch.checked"})[-1]["fact"]["exit"], 16, context("third verdict"))
-            self.assertEqual(marker.read_text(), "launch\nlaunch\n", context("third provider count"))
-            self.assertEqual(len(controller.journal.events({"attempt.started"})), 2, context("third reservation count"))
-            self.assertEqual(len(controller.journal.events({"attempt.launching"})), 2, context("third launch count"))
+        try:
+            with mock.patch("fleet_control.native_dispatch.evidence_environment", side_effect=observe_projection):
+                # Keep the original accept/dispatch ordering. Between attempts,
+                # inspect only returned values: no extra proof, journal, marker,
+                # or diagnostic serialization can warm caches or delay retry.
+                failing = replace(order, witnesses=((sys.executable, "-c", "raise SystemExit(7)"),))
+                self.accept(controller, failing, route, order_file)
+                results["first"] = self.dispatch(controller, failing, route)
+                assert_witness_failure(failing, results["first"])
+                stage = "second"
+                second = replace(failing, id="second-order", branch="fleet/second",
+                    authority_files=tuple(reversed(failing.authority_files)) + (failing.authority_files[0],),
+                    coordination=replace(failing.coordination, hypothesis="The revised boundary needs a narrower condition"))
+                self.accept(controller, second, route, order_file)
+                results["second"] = self.dispatch(controller, second, route)
+                assert_witness_failure(second, results["second"])
+                stage = "third"
+                third = replace(failing, id="third-order", branch="fleet/third",
+                    coordination=replace(failing.coordination, hypothesis="A third proposed condition does not reset the budget"))
+                self.accept(controller, third, route, order_file)
+                results["third"] = self.dispatch(controller, third, route)
+                self.assertIsInstance(results["third"], dict)
+                self.assertEqual(results["third"].get("error_type"), "NativeDispatchRefusal")
+
+            stage = "completed sequence"
+            rows = controller.journal.events()
+            starts = [row for row in rows if row["kind"] == "attempt.started"]
+            launches = [row for row in rows if row["kind"] == "attempt.launching"]
+            checks = [row for row in rows if row["kind"] == "dispatch.checked"]
+            expected_ids = [results["first"]["attempt_id"], results["second"]["attempt_id"]]
+            self.assertNotEqual(*expected_ids)
+            self.assertEqual(len(starts), 2)
+            self.assertEqual(len(launches), 2)
+            self.assertEqual([row["fact"]["attempt_id"] for row in starts], expected_ids)
+            self.assertEqual([row["fact"]["attempt_id"] for row in launches], expected_ids)
+            self.assertEqual(starts[0]["fact"]["dependency_subject"], starts[1]["fact"]["dependency_subject"])
+            self.assertEqual(checks[-1]["fact"]["exit"], 16)
+            self.assertEqual(marker.read_text(), "launch\nlaunch\n")
+        except Exception:
+            # Failure-only physical observation preserves the original exception
+            # and the actual dispatch sequence even if diagnostic IO also fails.
+            try:
+                print(context(stage), file=sys.stderr, flush=True)
+            except Exception:
+                pass
+            raise
 
     def test_native_artifact_changed_after_reservation_prevents_provider(self):
         controller, order, route, order_file, marker = self.setup_controller()
