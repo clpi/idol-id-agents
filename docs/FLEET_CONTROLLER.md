@@ -136,7 +136,7 @@ Add `native_dispatch` to the same private controller configuration. This is an i
   "native_dispatch": {
     "live_repository": "/absolute/reviewed/idol-live",
     "live_revision": "REPLACE_WITH_REVIEWED_40_HEX_LIVE_COMMIT",
-    "source_sha256": "02b0203d0affe7b7470826f911ef2fffd4f1fad3b202ed5aeadf1332e9336e24",
+    "source_sha256": "d1fd347ae16a0848752cf85fbf088e9645ba290ee93d8a43a316c50aff691088",
     "controls_sha256": "2751b922c90cad715dcccd1f60759fe354424a2b5c18c40601f7d8cccc6f9a8d",
     "compiler": "/absolute/reviewed/idol-compiler",
     "compiler_sha256": "REPLACE_WITH_ACTUAL_64_HEX_COMPILER_SHA256"
