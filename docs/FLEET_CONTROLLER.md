@@ -138,15 +138,17 @@ Add `native_dispatch` to the same private controller configuration. This is an i
   "native_dispatch": {
     "live_repository": "/absolute/reviewed/idol-live",
     "live_revision": "REPLACE_WITH_REVIEWED_40_HEX_LIVE_COMMIT",
-    "source_sha256": "d1fd347ae16a0848752cf85fbf088e9645ba290ee93d8a43a316c50aff691088",
-    "controls_sha256": "15ae127598f5375756b2bc95d1b8c168af010e84e197d942cd1adac9f8562ebf",
+    "source_sha256": "c8b9ea7b6edf60fbc41fddcda4ed4e53b10d2fd085de90d014d1ca89d84fbea0",
+    "controls_sha256": "60e5f90c9e06ec616d65bb24b2de57c082b404d627af83983e58bcf6b9d59215",
     "compiler": "/absolute/reviewed/idol-compiler",
     "compiler_sha256": "REPLACE_WITH_ACTUAL_64_HEX_COMPILER_SHA256"
   }
 }
 ```
 
-These source/control digests name this candidate's exact native contract; the LIVE revision must contain those exact blobs. A changed law, harness, compiler, configuration, or filesystem subject requires fresh calibration. Resolve an intended compiler symlink to its regular target before configuring it. The compiler pin is host-specific; a C-emitting test toolchain is not evidence that a direct binary can execute there.
+These digests pin the source and control harness; the selected LIVE revision must contain those exact blobs. A changed law, harness, compiler, configuration, or filesystem subject requires fresh calibration. Resolve an intended compiler symlink to its regular target before configuring it. The compiler pin is host-specific; a C-emitting test toolchain is not evidence that a direct binary can execute there.
+
+Native qualification of these source inputs remains pending. The [recorded direct compilation attempt](https://github.com/clpi/idol-live/actions/runs/39727608657/job/119655033092) refused before producing an artifact, so the native controls and real controller integration did not execute. Keep `observe-plan` and disabled routes until the exact selected source, compiler, artifact and consumer pass the direct qualification entrypoint below.
 
 ```sh
 idol-fleet --config /absolute/fleet.json calibrate
