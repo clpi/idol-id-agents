@@ -1,0 +1,18 @@
+{
+  "schema": "idol.fleet.slack-intake.v1",
+  "mode": "observe-plan",
+  "channel": "C0BVD016C9M",
+  "fleet_config": "~/.config/idol-fleet/idol.json",
+  "state_dir": "~/.local/state/idol-slack-intake",
+  "history_token_env": "IDOL_SLACK_MINIMAX_BOT_TOKEN",
+  "interval_seconds": 30,
+  "max_age_seconds": 3600,
+  "ignore_users": ["DEVIN_SLACK_USER_ID"],
+  "trusted_users": ["U0C07SYU4MR"],
+  "instructions": "Act proactively for Chris Pecunies. Read AGENTS.md and docs/spec/law.md before writing Idol code. Do the work; never post an unfulfilled promise.",
+  "agents": [
+    {"name": "MiniMax", "user_id": "MINIMAX_SLACK_USER_ID", "token_env": "IDOL_SLACK_MINIMAX_BOT_TOKEN", "route": "minimax-token-plan"},
+    {"name": "CloudflareAI", "user_id": "CLOUDFLARE_SLACK_USER_ID", "token_env": "IDOL_SLACK_CLOUDFLARE_BOT_TOKEN", "route": "cloudflare-included"},
+    {"name": "FactoryDroid", "user_id": "FACTORY_SLACK_USER_ID", "token_env": "IDOL_SLACK_FACTORY_BOT_TOKEN", "route": "factory-subscription"}
+  ]
+}

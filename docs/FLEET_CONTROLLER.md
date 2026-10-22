@@ -272,3 +272,16 @@ For a migration, preserve the exact configuration, holds, recovery policy, queue
 Set `IDOL_HEALTH_FLEET_MANAGER=system` in the health observer’s environment after both controller instances use the system manager. The observer reports the selected manager and checks each controller only there; tunnels retain their existing user-manager checks. An invalid manager setting refuses a healthy result.
 
 The version-pinned [systemd 257 namespace documentation](https://github.com/systemd/systemd/blob/v257/man/system-or-user-ns.xml) explains the implicit user namespace. This deployment preserves the filesystem restrictions while retaining same-account process visibility.
+
+## Untagged Slack intake
+
+Devin answers untagged `#idol-agents` messages because a Devin automation subscribes to `slack:message`. The other Slack apps only post from the agency loop and have no event subscription, so an untagged human message never reaches them. `scripts/slack_intake.py` closes that gap without a public endpoint: it polls one channel with `conversations.history`, takes top-level human messages that no configured fleet app has answered in-thread, rotates them across the configured apps, runs that app's fleet route as an argument vector, and replies in the thread with the same app's bot token.
+
+- Routes come from the fleet configuration and its calibration record; a stale or missing calibration disables every route. Only routes that pass `route_verdict` (local or witnessed included billing) are selected, so a pay-go app is skipped and the next admitted app takes the message. With none admitted, the message is recorded as refused and nothing is posted.
+- Slack text is untrusted input to an agent. Only top-level messages authored by a member of the required `trusted_users` allowlist are considered; everyone else is ignored. The route itself must carry the tool, filesystem, and network limits; prompt wording is not an enforcement boundary.
+- A message that tags specific users goes only to those apps; if it tags none of them it is left alone. Users in `ignore_users` (Devin) neither trigger intake nor count as an answer.
+- Each message is claimed in a private, locked ledger before execution and is attempted at most once; runtime or Slack failures are recorded, never retried or reported as success.
+- The route's final stdout line must be a JSON object with a non-empty `reply`, `text`, `output`, or `result` string. A local route reporting positive `costUsd` is refused.
+- `observe-plan` (the default) prints the selection per message and neither runs a route, posts, nor records. `apply` acts.
+
+Each bot needs `channels:history` (for the history token) and `chat:write`, with its token in the configured environment variable. Copy `config/slack-intake.example.json`, fill in the real Slack user IDs, token variables, and route IDs, then run `scripts/slack_intake.py CONFIG --loop` under the same user service as the fleet controller.
