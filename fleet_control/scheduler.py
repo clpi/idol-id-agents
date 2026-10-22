@@ -195,16 +195,56 @@ def build_plan(
         if not produced and not any(item.order_id == order.id for item in rejected):
             rejected.append(Rejection(order.id, None, ("no-eligible-route",)))
 
+    ranked = sorted(candidates, key=lambda item: (-item.score, item.order.id, item.route.id))
+    eligible: dict[str, list[Assignment]] = {}
+    for candidate in ranked:
+        eligible.setdefault(candidate.order.id, []).append(candidate)
+
     chosen: list[Assignment] = []
-    for candidate in sorted(candidates, key=lambda item: (-item.score, item.order.id, item.route.id)):
+    selected: set[str] = set()
+    for candidate in ranked:
         if len(chosen) >= max_assignments:
             break
+        if candidate.order.id in selected:
+            continue
         if any(orders_conflict(candidate.order, existing.order) for existing in chosen):
             rejected.append(Rejection(candidate.order.id, candidate.route.id, ("selected-claim-conflict",)))
             continue
         if counts.get(candidate.route.id, 0) >= candidate.route.max_parallel:
             continue
         chosen.append(candidate)
+        selected.add(candidate.order.id)
+        counts[candidate.route.id] = counts.get(candidate.route.id, 0) + 1
+
+    def reserve(route: Route, visited: set[str]) -> bool:
+        if route.id in visited:
+            return False
+        visited.add(route.id)
+        if counts.get(route.id, 0) < route.max_parallel:
+            return True
+        for index, held in enumerate(chosen):
+            if held.route.id != route.id:
+                continue
+            for alternative in eligible[held.order.id]:
+                if reserve(alternative.route, visited):
+                    chosen[index] = alternative
+                    counts[route.id] -= 1
+                    counts[alternative.route.id] = counts.get(alternative.route.id, 0) + 1
+                    return True
+        return False
+
+    for candidate in ranked:
+        if len(chosen) >= max_assignments:
+            break
+        if candidate.order.id in selected:
+            continue
+        if any(orders_conflict(candidate.order, existing.order) for existing in chosen):
+            continue
+        if not reserve(candidate.route, set()):
+            rejected.append(Rejection(candidate.order.id, candidate.route.id, ("route-parallel-capacity-full",)))
+            continue
+        chosen.append(candidate)
+        selected.add(candidate.order.id)
         counts[candidate.route.id] = counts.get(candidate.route.id, 0) + 1
 
     return Plan(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from itertools import product
 from pathlib import Path
 import unittest
 
@@ -11,7 +12,7 @@ from fleet_control.model import (
     Route,
     WorkOrder,
 )
-from fleet_control.scheduler import build_plan, orders_conflict, path_overlap, semantic_overlap
+from fleet_control.scheduler import Plan, build_plan, orders_conflict, path_overlap, semantic_overlap
 
 
 class SchedulerTests(unittest.TestCase):
@@ -176,6 +177,163 @@ class SchedulerTests(unittest.TestCase):
             now=self.now,
         )
         self.assertEqual(plan.assignments[0].route.id, "second")
+
+    def capacity_plan(
+        self,
+        orders: tuple[WorkOrder, ...],
+        routes: tuple[Route, ...],
+        *,
+        route_active: dict[str, int] | None = None,
+    ) -> Plan:
+        return build_plan(
+            base_sha="a" * 40,
+            orders=orders,
+            routes=routes,
+            max_assignments=len(orders),
+            now=self.now,
+            route_active=route_active,
+        )
+
+    def test_flexible_order_does_not_starve_restricted_order(self) -> None:
+        plan = self.capacity_plan(
+            (
+                self.order("a", route_ids=("cheap", "fallback"), priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b"),
+            ),
+            (self.route("cheap"), self.route("fallback")),
+        )
+        self.assertEqual(
+            {item.order.id: item.route.id for item in plan.assignments},
+            {"a": "fallback", "b": "cheap"},
+        )
+        self.assertAlmostEqual(plan.assignments[0].score, plan.assignments[1].score * 90 / 50)
+
+    def test_rebalance_can_follow_multiple_route_hops(self) -> None:
+        plan = self.capacity_plan(
+            (
+                self.order("a", route_ids=("r1", "r2"), priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b", route_ids=("r2", "r3"), priority=80),
+                self.order("c", path="lib/c.id", semantic="world/c", route_ids=("r1",)),
+            ),
+            (self.route("r1"), self.route("r2"), self.route("r3")),
+        )
+        self.assertEqual(
+            {item.order.id: item.route.id for item in plan.assignments},
+            {"a": "r2", "b": "r3", "c": "r1"},
+        )
+
+    def test_active_route_capacity_is_not_moved_or_overbooked(self) -> None:
+        plan = self.capacity_plan(
+            (
+                self.order("a", route_ids=("cheap", "fallback"), priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b"),
+            ),
+            (self.route("cheap"), self.route("fallback")),
+            route_active={"fallback": 1},
+        )
+        self.assertEqual([(item.order.id, item.route.id) for item in plan.assignments], [("a", "cheap")])
+
+    def test_rebalance_never_uses_rejected_routes(self) -> None:
+        forbidden = replace(self.route("paygo"), billing=BillingClass.PAYGO)
+        forbidden = replace(forbidden, proof=replace(forbidden.proof, subject_hash=forbidden.subject_hash))
+        plan = self.capacity_plan(
+            (
+                self.order("a", route_ids=("cheap", "paygo"), priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b"),
+            ),
+            (self.route("cheap"), forbidden),
+        )
+        self.assertEqual([(item.order.id, item.route.id) for item in plan.assignments], [("a", "cheap")])
+        self.assertTrue(any("billing-paygo-forbidden" in row.reasons for row in plan.rejections))
+
+    def test_rebalance_respects_multi_slot_capacity(self) -> None:
+        cheap = replace(self.route("cheap"), max_parallel=2)
+        cheap = replace(cheap, proof=replace(cheap.proof, subject_hash=cheap.subject_hash))
+        plan = self.capacity_plan(
+            (
+                self.order("a", route_ids=("cheap", "fallback"), priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b", priority=80),
+                self.order("c", path="lib/c.id", semantic="world/c"),
+            ),
+            (cheap, self.route("fallback")),
+            route_active={"cheap": 1},
+        )
+        self.assertEqual({item.order.id: item.route.id for item in plan.assignments}, {"a": "fallback", "b": "cheap"})
+
+    def test_rebalance_fills_many_independent_provider_slots(self) -> None:
+        routes = tuple(self.route(f"route-{index:03}") for index in range(101))
+        orders = tuple(
+            self.order(
+                f"order-{index:03}",
+                path=f"lib/{index}.id",
+                semantic=f"world/{index}",
+                route_ids=(routes[index].id, routes[index + 1].id),
+                priority=90,
+            )
+            for index in range(100)
+        ) + (self.order("restricted", path="lib/restricted.id", semantic="world/restricted", route_ids=(routes[0].id,)),)
+        plan = self.capacity_plan(orders, routes)
+        self.assertEqual(len(plan.assignments), len(orders))
+        self.assertEqual(len({item.order.id for item in plan.assignments}), len(orders))
+        self.assertEqual(len({item.route.id for item in plan.assignments}), len(routes))
+
+    def test_full_route_cycles_leave_selected_assignments_unchanged(self) -> None:
+        plan = self.capacity_plan(
+            (
+                self.order("a", route_ids=("r1", "r2"), priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b", route_ids=("r1", "r2"), priority=80),
+                self.order("c", path="lib/c.id", semantic="world/c", route_ids=("r1", "r2")),
+            ),
+            (self.route("r1"), self.route("r2")),
+        )
+        self.assertEqual({item.order.id: item.route.id for item in plan.assignments}, {"a": "r1", "b": "r2"})
+        self.assertTrue(any(row.order_id == "c" and "route-parallel-capacity-full" in row.reasons for row in plan.rejections))
+
+    def test_rebalance_preserves_independent_reviewer_family(self) -> None:
+        plan = self.capacity_plan(
+            (
+                self.order("a", role="reviewer", route_ids=("cheap", "same"), reviewer_family="openai", priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b"),
+            ),
+            (self.route("cheap"), self.route("same", family="openai")),
+        )
+        self.assertEqual([(item.order.id, item.route.id) for item in plan.assignments], [("a", "cheap")])
+        self.assertTrue(any("reviewer-family-not-independent" in row.reasons for row in plan.rejections))
+
+    def test_greedy_preferences_are_preserved_when_capacity_is_sufficient(self) -> None:
+        plan = self.capacity_plan(
+            (
+                self.order("a", route_ids=("cheap", "premium"), priority=90),
+                self.order("b", path="lib/b.id", semantic="world/b", route_ids=("cheap", "fallback")),
+            ),
+            (self.route("cheap"), self.route("fallback"), self.route("premium", premium=True)),
+        )
+        self.assertEqual({item.order.id: item.route.id for item in plan.assignments}, {"a": "cheap", "b": "fallback"})
+
+    def test_small_independent_route_graphs_match_capacity_oracle(self) -> None:
+        routes = tuple(self.route(f"r{index}") for index in range(3))
+        choices = tuple(
+            tuple(route.id for index, route in enumerate(routes) if mask & (1 << index))
+            for mask in range(1, 8)
+        )
+        for allowed in product(choices, repeat=3):
+            with self.subTest(allowed=allowed):
+                orders = tuple(
+                    self.order(f"o{index}", path=f"lib/{index}.id", semantic=f"world/{index}", route_ids=ids)
+                    for index, ids in enumerate(allowed)
+                )
+                expected = max(
+                    sum(route is not None for route in assignment)
+                    for assignment in product(*((None,) + ids for ids in allowed))
+                    if len([route for route in assignment if route is not None])
+                    == len({route for route in assignment if route is not None})
+                )
+                plan = self.capacity_plan(orders, routes)
+                self.assertEqual(len(plan.assignments), expected)
+                self.assertEqual(len({item.order.id for item in plan.assignments}), expected)
+                self.assertEqual(len({item.route.id for item in plan.assignments}), expected)
+                for item in plan.assignments:
+                    self.assertIn(item.route.id, item.order.route_ids)
 
 
 if __name__ == "__main__":
