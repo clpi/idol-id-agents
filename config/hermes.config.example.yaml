@@ -1,0 +1,46 @@
+# Operator surface for a Hermes host. This file is not installed.
+# Do not set the chat model to jev-latest. Do not point compression or
+# vision at Jev. Jev, when TYPESAFE_API_KEY exists, is an advisory scorer
+# (jev_decide / jev_rank / jev_verify). If the key is absent, leave it unset
+# and let the chat model continue. Do not invent a gateway token.
+
+model:
+  provider: anthropic
+  name: claude-opus-4
+
+memory:
+  memory_enabled: true
+  user_profile_enabled: true
+  write_approval: true
+
+skills:
+  auto_load: true
+  guard_agent_created: true
+  write_approval: true
+
+agent:
+  auto_recovery_cycles: 2
+  verify_on_stop: true
+
+# Messaging stays off until a real token file is on the host.
+gateway:
+  platforms:
+    telegram:
+      enabled: false
+    discord:
+      enabled: false
+
+# Providers that exist as accounts but have no witnessed included allowance.
+# Listing one here does not select it. The chat model above stays the default.
+providers:
+  apodex:
+    base_url: https://api.apodex.ai/v1
+    # api_key comes from the host environment, never from this file
+  inception:
+    note: paygo; fleet law refuses it until a witnessed included plan exists
+  poolside:
+    note: no account evidence and no key on this host
+  autohand:
+    note: verified Autohand Code mail exists; no local allowance proof
+  zo:
+    note: persistent computer for chrisp1877@gmail.com; not a model route
