@@ -1,16 +1,60 @@
 from __future__ import annotations
 
 import fcntl
+from contextlib import contextmanager
+from copy import deepcopy
 import hashlib
 import json
 import os
 from pathlib import Path
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 
 class JournalError(RuntimeError):
     pass
+
+
+class JournalTransaction:
+    """A verified snapshot and append operations sharing one exclusive lock."""
+
+    def __init__(self, journal: "Journal", handle, rows: list[dict[str, Any]]) -> None:
+        self._journal = journal
+        self._handle = handle
+        self._rows = rows
+        self._closed = False
+
+    def _open(self) -> None:
+        if self._closed:
+            raise JournalError("journal transaction is closed")
+
+    def events(self, kinds: Iterable[str] | None = None) -> tuple[dict[str, Any], ...]:
+        self._open()
+        allowed = None if kinds is None else frozenset(kinds)
+        return tuple(deepcopy(row) for row in self._rows if allowed is None or row.get("kind") in allowed)
+
+    def append(self, kind: str, fact: Mapping[str, Any], *, at: float | None = None) -> dict[str, Any]:
+        self._open()
+        if not kind or not isinstance(kind, str):
+            raise ValueError("journal kind is required")
+        if not isinstance(fact, Mapping):
+            raise ValueError("journal fact must be a mapping")
+        record: dict[str, Any] = {
+            "sequence": len(self._rows) + 1,
+            "at": time.time() if at is None else float(at),
+            "kind": kind,
+            "previous": self._rows[-1]["hash"] if self._rows else "0" * 64,
+            "fact": deepcopy(dict(fact)),
+        }
+        record["hash"] = self._journal._digest(record)
+        self._handle.seek(0, os.SEEK_END)
+        self._handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._rows.append(record)
+        self._journal._rows = tuple(self._rows)
+        self._journal._signature = self._journal._file_signature(self._handle)
+        return deepcopy(record)
 
 
 class Journal:
@@ -100,38 +144,33 @@ class Journal:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-    def append(self, kind: str, fact: Mapping[str, Any], *, at: float | None = None) -> dict[str, Any]:
-        if not kind or not isinstance(kind, str):
-            raise ValueError("journal kind is required")
-        if not isinstance(fact, Mapping):
-            raise ValueError("journal fact must be a mapping")
+    @contextmanager
+    def transaction(self) -> Iterator[JournalTransaction]:
+        """Serialize evidence read, native decision, and durable reservation.
+
+        Callers holding the local control guard acquire it before this lock.
+        Use the yielded transaction for appends; opening another journal lock
+        from the same critical section would deadlock.
+        """
         with self.path.open("r+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            transaction = None
             try:
                 signature = self._file_signature(handle)
                 if self._signature == signature:
                     rows = list(self._rows)
                 else:
                     rows = self._read_locked(handle)
-                previous = rows[-1]["hash"] if rows else "0" * 64
-                record: dict[str, Any] = {
-                    "sequence": len(rows) + 1,
-                    "at": time.time() if at is None else float(at),
-                    "kind": kind,
-                    "previous": previous,
-                    "fact": dict(fact),
-                }
-                record["hash"] = self._digest(record)
-                handle.seek(0, os.SEEK_END)
-                handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-                rows.append(record)
-                self._rows = tuple(rows)
-                self._signature = self._file_signature(handle)
-                return record
+                transaction = JournalTransaction(self, handle, rows)
+                yield transaction
             finally:
+                if transaction is not None:
+                    transaction._closed = True
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def append(self, kind: str, fact: Mapping[str, Any], *, at: float | None = None) -> dict[str, Any]:
+        with self.transaction() as transaction:
+            return transaction.append(kind, fact, at=at)
 
     def events(self, kinds: Iterable[str] | None = None) -> tuple[dict[str, Any], ...]:
         rows = self._snapshot()

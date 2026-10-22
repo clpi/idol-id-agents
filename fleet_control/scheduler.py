@@ -135,6 +135,7 @@ def build_plan(
     active_orders: Iterable[WorkOrder] = (),
     route_active: Mapping[str, int] | None = None,
     route_performance: Mapping[str, float] | None = None,
+    acknowledged_routes: Mapping[str, frozenset[str]] | None = None,
     max_assignments: int = 1,
     now: float | None = None,
 ) -> Plan:
@@ -154,8 +155,14 @@ def build_plan(
         if order_reasons:
             rejected.append(Rejection(order.id, None, tuple(order_reasons)))
             continue
+        route_ids = order.route_ids
+        if acknowledged_routes is not None and order.id in acknowledged_routes:
+            route_ids = tuple(route_id for route_id in route_ids if route_id in acknowledged_routes[order.id])
+            if not route_ids:
+                rejected.append(Rejection(order.id, None, ("acknowledged-route-unavailable",)))
+                continue
         produced = False
-        for route_id in order.route_ids:
+        for route_id in route_ids:
             route = route_by_id.get(route_id)
             if route is None:
                 rejected.append(Rejection(order.id, route_id, ("route-missing",)))

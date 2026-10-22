@@ -334,6 +334,59 @@ class Route:
 
 
 @dataclass(frozen=True, slots=True)
+class Coordination:
+    """Immutable declared facts. The native law decides their legality."""
+
+    mode: str
+    recipient: str
+    parent_task: str = ""
+    parent_subject: str = ""
+    hypothesis: str = ""
+    attempts: int = 2
+    allowance: int = 900
+    recovery: str = ""
+    question: str = ""
+    artifact: str = ""
+    recipe: str = ""
+    prerequisites: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for label in ("mode", "recipient", "parent_task", "parent_subject", "hypothesis",
+                      "recovery", "question", "artifact", "recipe"):
+            value = getattr(self, label)
+            if not isinstance(value, str) or len(value.encode("utf-8")) > 16384 or "\0" in value:
+                raise ValueError(f"coordination {label} must be a bounded string")
+        for label in ("attempts", "allowance"):
+            value = getattr(self, label)
+            if type(value) is not int or not 0 <= value <= 2_147_483_647:
+                raise ValueError(f"coordination {label} must be a nonnegative bounded integer")
+        if self.artifact:
+            validate_relative_path(self.artifact)
+        if not isinstance(self.prerequisites, tuple) or any(
+            not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in self.prerequisites
+        ):
+            raise ValueError("coordination prerequisites must be exact journal event hashes")
+        if len(self.prerequisites) > 32 or len(set(self.prerequisites)) != len(self.prerequisites):
+            raise ValueError("coordination prerequisites must be bounded and distinct")
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> "Coordination":
+        names = set(cls.__dataclass_fields__)
+        if set(raw) - names:
+            raise ValueError("unknown coordination fields: " + ", ".join(sorted(set(raw) - names)))
+        return cls(
+            mode=raw.get("mode", ""), recipient=raw.get("recipient", ""),
+            parent_task=raw.get("parent_task", ""), parent_subject=raw.get("parent_subject", ""),
+            hypothesis=raw.get("hypothesis", ""), attempts=raw.get("attempts", 2),
+            allowance=raw.get("allowance", 900), recovery=raw.get("recovery", ""),
+            question=raw.get("question", ""), artifact=raw.get("artifact", ""),
+            recipe=raw.get("recipe", ""),
+            prerequisites=tuple(sequence(raw.get("prerequisites", ()), "prerequisites")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class WorkOrder:
     id: str
     task_id: str
@@ -358,6 +411,7 @@ class WorkOrder:
     create_draft_pr: bool = True
     follow_remote_main: bool = False
     allow_no_change: bool = False
+    coordination: Coordination | None = None
 
     def __post_init__(self) -> None:
         for label, value in (("work-order id", self.id), ("task id", self.task_id), ("role", self.role)):
@@ -390,6 +444,8 @@ class WorkOrder:
             raise ValueError("estimated_tokens must be positive")
         if self.allow_no_change and self.role not in {"counterexample", "evidence", "observer", "reviewer"}:
             raise ValueError("allow_no_change is limited to evidence-producing roles")
+        if self.coordination is not None and not isinstance(self.coordination, Coordination):
+            raise ValueError("coordination must be an immutable Coordination declaration")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "WorkOrder":
@@ -426,6 +482,10 @@ class WorkOrder:
             create_draft_pr=raw.get("create_draft_pr", True) is True,
             follow_remote_main=raw.get("follow_remote_main", False) is True,
             allow_no_change=raw.get("allow_no_change", False) is True,
+            coordination=(
+                Coordination.from_mapping(mapping(raw["coordination"], "coordination"))
+                if raw.get("coordination") is not None else None
+            ),
         )
 
 

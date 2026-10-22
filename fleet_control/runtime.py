@@ -15,6 +15,7 @@ from .model import BillingClass, Route, WorkOrder
 from .policy import assert_order_route
 from .control import AttemptPermit, ControlRefusal, LocalControl
 from .processes import kill_group_and_reap
+from .native_dispatch import NativeDispatcher, NativeDispatchRefusal
 
 
 class RuntimeRefusal(RuntimeError):
@@ -27,12 +28,13 @@ class ExecutionBindingRefusal(ControlRefusal):
 
 def execution_subject(
     *, order: WorkOrder, route: Route, attempt_id: str, prompt: bytes, cwd: Path,
+    native_subject: str | None = None,
 ) -> str:
     """Bind physical launch inputs, without interpreting work-order semantics."""
     order_fields = asdict(order)
     order_fields["repository"] = str(order.repository)
     payload = {
-        "schema": "idol.fleet.execution-subject.v1",
+        "schema": "idol.fleet.execution-subject.v2",
         "order": order_fields,
         "route_subject": route.subject_hash,
         # Calibration identity deliberately excludes this actual launch bound.
@@ -40,6 +42,7 @@ def execution_subject(
         "attempt_id": attempt_id,
         "prompt_sha256": hashlib.sha256(prompt).hexdigest(),
         "cwd": str(cwd),
+        "native_subject": native_subject,
     }
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
@@ -69,10 +72,12 @@ class CommandRuntime:
 
     _BASE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SHELL", "USER", "LOGNAME")
 
-    def __init__(self, state_dir: Path, *, control: LocalControl | None = None) -> None:
+    def __init__(self, state_dir: Path, *, control: LocalControl | None = None,
+                 native: NativeDispatcher | None = None) -> None:
         self.state_dir = Path(state_dir).expanduser()
         self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.control = control if control is not None else LocalControl(self.state_dir / "control")
+        self.native = native
 
     @staticmethod
     def _format_argument(argument: str, values: Mapping[str, str]) -> str:
@@ -275,11 +280,15 @@ class CommandRuntime:
         prompt_snapshot: Path | None = None
         try:
             with self.control.transition_permit("process", attempt_permit):
+                if self.native is None:
+                    raise NativeDispatchRefusal("provider launch requires a configured native dispatch gate")
+                native_subject = self.native.subject()
                 # The guard authenticates the permit before this binding check.
                 # Both argv forms below use the exact captured and admitted bytes.
                 subject_hash = execution_subject(
                     order=order, route=route, attempt_id=attempt_permit.attempt_id,
                     prompt=prompt_bytes, cwd=cwd,
+                    native_subject=native_subject,
                 )
                 if not hmac.compare_digest(subject_hash, attempt_permit.subject_hash):
                     raise ExecutionBindingRefusal("execution input differs from the admitted attempt subject")
@@ -302,16 +311,28 @@ class CommandRuntime:
                     "usage": str(usage_path),
                 }
                 command = [self._format_argument(argument, values) for argument in route.command]
-                process = subprocess.Popen(
-                    command,
-                    cwd=cwd,
-                    env=self._environment(route, order),
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    start_new_session=True,
-                )
+                with self.native.journal.transaction() as transaction:
+                    facts = self.native.decide(
+                        phase="launch", order=order, route=route, attempt_id=attempt_permit.attempt_id,
+                        transaction=transaction, native_subject=native_subject,
+                    )
+                    # Reserve before Popen. A failed or interrupted launch stays
+                    # visible and can never replay this same authenticated permit.
+                    transaction.append("attempt.launching", {
+                        **facts, "attempt_id": attempt_permit.attempt_id, "order_id": order.id,
+                        "task_id": order.task_id, "route_id": route.id, "provider": route.provider,
+                        "model": route.model, "subject_hash": subject_hash,
+                    })
+                    process = subprocess.Popen(
+                        command,
+                        cwd=cwd,
+                        env=self._environment(route, order),
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        start_new_session=True,
+                    )
         except BaseException:
             if process is not None:
                 kill_group_and_reap(process)

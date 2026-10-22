@@ -12,10 +12,12 @@ import unittest
 from unittest import mock
 import subprocess
 
-from fleet_control.model import BillingClass, BillingProof, Route, WorkOrder
+from fleet_control.model import BillingClass, BillingProof, Coordination, Route, WorkOrder
+from fleet_control.journal import Journal
 from fleet_control.control import ControlIntegrityError, ControlRefusal
 from fleet_control.runtime import CommandRuntime, ExecutionBindingRefusal, RuntimeRefusal, execution_subject
 from tests.process_helpers import process_stopped
+from tests.native_transport_fixture import TransportOnlyGate
 
 
 class RuntimeTests(unittest.TestCase):
@@ -64,6 +66,8 @@ class RuntimeTests(unittest.TestCase):
         )
 
     def permit(self, runtime, route, order, prompt, *, cwd=None, attempt_id="runtime-test-attempt"):
+        if runtime.native is None:
+            runtime.native = TransportOnlyGate(journal=Journal(runtime.state_dir / "unit-history.jsonl"))
         if not runtime.control.status().permitted:
             runtime.control.enable(ttl_seconds=600)
         with runtime.control.transition_permit("claim") as guard:
@@ -72,6 +76,7 @@ class RuntimeTests(unittest.TestCase):
                 subject_hash=execution_subject(
                     order=order, route=route, attempt_id=attempt_id,
                     prompt=prompt.read_bytes(), cwd=order.repository if cwd is None else cwd,
+                    native_subject=runtime.native.subject(),
                 ),
             )
 
@@ -134,6 +139,7 @@ class RuntimeTests(unittest.TestCase):
                 "create_draft_pr": False,
                 "follow_remote_main": True,
                 "allow_no_change": True,
+                "coordination": Coordination(mode="deliberate", recipient="different-worker"),
             }
             self.assertEqual(set(replacements), set(order.__dataclass_fields__))
             for field, value in replacements.items():
