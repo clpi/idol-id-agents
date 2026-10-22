@@ -15,7 +15,7 @@ from typing import Any, Mapping, Sequence
 from .control import ControlRefusal
 from .coordination import (
     CoordinationError, assignment_subject, declaration, dependency_subject, digest,
-    premise_subject, read_regular, route_subject, scope_subject,
+    latest_assignment_ack, premise_subject, read_regular, route_subject, scope_subject,
 )
 from .journal import Journal, JournalTransaction
 from .model import Route, WorkOrder, stable_hash
@@ -174,7 +174,7 @@ def calibrate_native(
             except FileExistsError:
                 if read_regular(target, maximum=128 * 1024 * 1024) != content:
                     raise NativeDispatchRefusal("concurrent native artifact differs")
-        artifact = asdict(Route._capture_proof_subject(target))
+    artifact = asdict(Route._capture_proof_subject(target))
     return {
         "schema": "idol.fleet.native-dispatch-proof.v1", "backend": "direct",
         "config_subject": config.subject(), "observed_at": observed_at, "expires_at": expires_at,
@@ -241,7 +241,7 @@ def evidence_environment(
     if phase == "launch" and own is not None:
         accepted = _event(rows, _text(_fact(own).get("ack_event")))
     else:
-        accepted = next((row for row in reversed(rows) if row.get("kind") == "assignment.ack" and _fact(row).get("task_id") == order.task_id), None)
+        accepted = latest_assignment_ack(rows, order.task_id)
     if accepted is not None and accepted.get("kind") != "assignment.ack":
         accepted = None
     _ack_fields(env, "ACK_", accepted)

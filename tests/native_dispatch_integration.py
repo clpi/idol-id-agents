@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Required real-direct native integration lane; never skips or falls back.
 
-One canonical law is compiled and directly qualified, then its same proven
-bytes are placed in each isolated controller fixture. No model is invoked.
+One canonical law is compiled and directly qualified. Isolated controllers
+consume its returned proof unchanged. No model is invoked.
 """
 from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout, redirect_stderr
-from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import replace
 import hashlib
 import io
 import json
@@ -31,11 +30,12 @@ from fleet_control.coordination import (
     acknowledge, assignment_subject, canonical, delegate, load_order, order_mapping, verify_recipe,
 )
 from fleet_control.controller import FleetController
-from fleet_control.model import Assignment, Route, stable_hash
+from fleet_control.model import Assignment, stable_hash
 from fleet_control.native_dispatch import (
     CONTROLS, LAW, NativeDispatchRefusal, calibrate_native, evidence_environment,
 )
 from tests.test_coordination import fixture as physical_fixture
+from tests.test_ack_routing import two_route_fixture
 
 
 NATIVE_CONFIG = None
@@ -50,33 +50,30 @@ class NativeIntegrationTests(unittest.TestCase):
         cls.artifact_directory = tempfile.TemporaryDirectory(prefix="idol-native-qualified-")
         cls.addClassCleanup(cls.artifact_directory.cleanup)
         now = time.time()
-        # Exactly one production direct compile and canonical control run.
+        # Qualify one production artifact for cases that can safely share it.
         cls.native_proof = calibrate_native(
             raw_config={"native_dispatch": NATIVE_CONFIG}, state_dir=Path(cls.artifact_directory.name),
             observed_at=now, expires_at=now + 3600,
         )
-        cls.binary = Path(cls.native_proof["artifact"]["path"]).read_bytes()
         PROVENANCE["native_proof"] = cls.native_proof
 
-    def setup_controller(self):
-        temporary, initial, order, route, order_file, claim_log = physical_fixture()
+    def setup_controller(self, *, two_routes=False, isolated_artifact=False):
+        temporary, initial, order, route, order_file, claim_log = (two_route_fixture if two_routes else physical_fixture)()
         self.addCleanup(temporary.cleanup)
         raw = json.loads(initial.config_path.read_text())
         raw["native_dispatch"] = NATIVE_CONFIG
         initial.config_path.write_text(json.dumps(raw))
-        proof = deepcopy(self.native_proof)
-        target = initial.config.state_dir / "native-dispatch" / f"{proof['artifact']['sha256']}.bin"
-        target.parent.mkdir(mode=0o700)
-        target.write_bytes(self.binary)
-        target.chmod(0o500)
-        proof["artifact"] = asdict(Route._capture_proof_subject(target))
-        # Route calibration is unchanged. This is the same independently
-        # qualified native artifact and source proof, relocated by exact bytes.
+        proof = self.native_proof
+        if isolated_artifact:
+            now = time.time()
+            proof = calibrate_native(raw_config=raw, state_dir=initial.config.state_dir,
+                                     observed_at=now, expires_at=now + 3600)
         calibration = json.loads(initial.config.calibration_file.read_text())
         calibration.update(config_hash=stable_hash(raw), native_dispatch=proof)
         initial.config.calibration_file.write_text(json.dumps(calibration))
         controller = FleetController(config_path=initial.config_path)
-        route = controller._routes()[0]
+        self.assertEqual(canonical(controller.native.proof()), canonical(proof))
+        route = next(item for item in controller._routes() if item.id == route.id)
         marker = initial.config.state_dir / "provider-launched"
         agent = Path(route.command[1])
         source = agent.read_text()
@@ -125,6 +122,57 @@ class NativeIntegrationTests(unittest.TestCase):
         self.assertEqual(start["fact"]["ack_event"], ack["hash"])
         self.assertEqual(start["fact"]["subject_hash"], launching["fact"]["subject_hash"])
         self.assertEqual([row["fact"]["phase"] for row in controller.journal.events({"dispatch.checked"})], ["reserve", "launch"])
+
+    def plan(self, controller, order):
+        observation, _ = controller.observe()
+        return controller.plan(observation, (order,), controller._routes())
+
+    def test_ack_route_survives_higher_scoring_route_and_dispatches_unchanged_order(self):
+        controller, order, route, order_file, marker = self.setup_controller(two_routes=True)
+        routes = controller._routes()
+        self.assertEqual({item.id for item in routes}, {"local-test", "aaa-preferred"})
+        self.assertTrue(all(item.enabled and item.proof.trusted for item in routes))
+        accepted = self.accept(controller, order, route, order_file)
+        with mock.patch("fleet_control.controller.route_factors", return_value={"local-test": 0.4, "aaa-preferred": 1.6}):
+            plan = self.plan(controller, order)
+        self.assertEqual(len(plan.assignments), 1)
+        assignment = plan.assignments[0]
+        self.assertEqual(assignment.route.id, "local-test")
+        self.assertIs(assignment.order, order)
+        self.assertEqual(assignment_subject(assignment.order), accepted["fact"]["assignment_subject"])
+        self.assertIn("commit", controller.dispatch(assignment))
+        self.assertEqual(marker.read_text(), "launch\n")
+        self.assertEqual([row["fact"]["phase"] for row in controller.journal.events({"dispatch.checked"})], ["reserve", "launch"])
+
+    def test_stale_or_changed_assignment_ack_routes_but_native_refuses(self):
+        for changed in ({"expires_at": 1}, {"assignment_subject": "f" * 64}):
+            with self.subTest(changed=changed):
+                controller, order, route, order_file, marker = self.setup_controller(two_routes=True)
+                accepted = self.accept(controller, order, route, order_file)
+                controller.journal.append("assignment.ack", {**accepted["fact"], **changed})
+                plan = self.plan(controller, order)
+                self.assertEqual(len(plan.assignments), 1)
+                assignment = plan.assignments[0]
+                self.assertEqual(assignment.route.id, "local-test")
+                self.assertIs(assignment.order, order)
+                result = controller.dispatch(assignment)
+                self.assertEqual(result["error_type"], "NativeDispatchRefusal")
+                self.assert_never_started(controller, marker)
+                self.assertEqual(controller.journal.events({"dispatch.checked"})[-1]["fact"]["exit"], 8)
+
+    def test_new_route_ack_after_planning_refuses_the_old_assignment(self):
+        controller, order, route, order_file, marker = self.setup_controller(two_routes=True)
+        self.accept(controller, order, route, order_file)
+        plan = self.plan(controller, order)
+        self.assertEqual(len(plan.assignments), 1)
+        assignment = plan.assignments[0]
+        self.assertEqual(assignment.route.id, "local-test")
+        alternate = next(item for item in controller._routes() if item.id == "aaa-preferred")
+        self.accept(controller, order, alternate, order_file)
+        result = controller.dispatch(assignment)
+        self.assertEqual(result["error_type"], "NativeDispatchRefusal")
+        self.assert_never_started(controller, marker)
+        self.assertEqual(controller.journal.events({"dispatch.checked"})[-1]["fact"]["exit"], 8)
 
     def test_corrupt_raw_ack_fields_cannot_start_a_provider(self):
         for field, value in {
@@ -344,7 +392,7 @@ class NativeIntegrationTests(unittest.TestCase):
             raise
 
     def test_native_artifact_changed_after_reservation_prevents_provider(self):
-        controller, order, route, order_file, marker = self.setup_controller()
+        controller, order, route, order_file, marker = self.setup_controller(isolated_artifact=True)
         self.accept(controller, order, route, order_file)
         execute = controller.runtime.execute
         artifact = Path(controller.native.proof()["artifact"]["path"])

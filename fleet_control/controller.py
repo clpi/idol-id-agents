@@ -21,7 +21,7 @@ from .calibration import (
 )
 from .claims import ControllerLease, RepositoryClaimTransaction, SemanticClaimStore
 from .control import ControlRefusal, LocalControl
-from .coordination import CoordinationError, local_path, read_regular
+from .coordination import CoordinationError, latest_assignment_ack, local_path, read_regular, route_subject
 from .evidence import retain_candidate_evidence
 from .gitops import (
     GitRefusal,
@@ -688,6 +688,19 @@ class FleetController:
             for order in orders
             if order.id in active_ids
         )
+        acknowledgements = self.journal.events({"assignment.ack"})
+        acknowledged_routes: dict[str, frozenset[str]] = {}
+        for order in available:
+            accepted = latest_assignment_ack(acknowledgements, order.task_id)
+            if accepted is not None:
+                fact = accepted["fact"]
+                # Constrain candidates without rewriting the immutable order or
+                # treating acceptance as a permit. Native reserve/launch checks
+                # still own freshness, identity, and current task history.
+                acknowledged_routes[order.id] = frozenset(
+                    route.id for route in routes
+                    if route.id == fact.get("route_id") and route_subject(route) == fact.get("route_subject")
+                )
         plan = build_plan(
             base_sha=observation.head,
             orders=available,
@@ -695,6 +708,7 @@ class FleetController:
             max_assignments=self.config.max_assignments,
             now=observation.at,
             route_performance=route_factors(self.journal),
+            acknowledged_routes=acknowledged_routes,
         )
         if duplicate_rejections:
             plan = Plan(

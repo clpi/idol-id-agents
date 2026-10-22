@@ -146,6 +146,11 @@ def _last(rows: Sequence[Mapping[str, Any]], kind: str, **facts: Any) -> Mapping
     return None
 
 
+def latest_assignment_ack(rows: Sequence[Mapping[str, Any]], task_id: str) -> Mapping[str, Any] | None:
+    """Select raw acceptance evidence; only the native law decides its validity."""
+    return _last(rows, "assignment.ack", task_id=task_id)
+
+
 def acknowledge(
     *, journal: Journal, order: WorkOrder, route: Route, recipient: str,
     ttl_seconds: int = 3600, now: int | None = None,
