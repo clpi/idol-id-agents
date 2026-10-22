@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import time
 import unittest
@@ -13,7 +14,7 @@ import subprocess
 
 from fleet_control.model import BillingClass, BillingProof, Route, WorkOrder
 from fleet_control.control import ControlIntegrityError, ControlRefusal
-from fleet_control.runtime import CommandRuntime, RuntimeRefusal
+from fleet_control.runtime import CommandRuntime, ExecutionBindingRefusal, RuntimeRefusal, execution_subject
 from tests.process_helpers import process_stopped
 
 
@@ -62,10 +63,17 @@ class RuntimeTests(unittest.TestCase):
             estimated_tokens=1,
         )
 
-    def permit(self, runtime):
-        runtime.control.enable(ttl_seconds=600)
+    def permit(self, runtime, route, order, prompt, *, cwd=None, attempt_id="runtime-test-attempt"):
+        if not runtime.control.status().permitted:
+            runtime.control.enable(ttl_seconds=600)
         with runtime.control.transition_permit("claim") as guard:
-            self.attempt_permit = guard.issue_attempt_permit("runtime-test-attempt")
+            self.attempt_permit = guard.issue_attempt_permit(
+                attempt_id,
+                subject_hash=execution_subject(
+                    order=order, route=route, attempt_id=attempt_id,
+                    prompt=prompt.read_bytes(), cwd=order.repository if cwd is None else cwd,
+                ),
+            )
 
     def execute_script(self, script_body: str):
         temporary = tempfile.TemporaryDirectory()
@@ -76,8 +84,9 @@ class RuntimeTests(unittest.TestCase):
         prompt.write_text("prompt")
         route = self.route((os.environ.get("PYTHON", "python3"), str(script)))
         runtime = CommandRuntime(root / "state")
-        self.permit(runtime)
-        return temporary, runtime, route, self.order(root), prompt
+        order = self.order(root)
+        self.permit(runtime, route, order, prompt)
+        return temporary, runtime, route, order, prompt
 
     def test_plain_json_success(self) -> None:
         temporary, runtime, route, order, prompt = self.execute_script(
@@ -88,6 +97,163 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(result.model, "test-model")
             self.assertEqual(result.cost_usd, 0.0)
             self.assertFalse(result.stdout_truncated)
+            self.assertEqual(list(runtime.state_dir.glob("idol-fleet-prompt-*")), [])
+
+    def test_permit_refuses_every_swapped_work_order_field_before_launch(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script(
+            "import json, pathlib\n"
+            "pathlib.Path(__file__).with_name('provider-ran').write_text('ran')\n"
+            "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0}))\n"
+        )
+        with temporary:
+            route = replace(route, roles=frozenset({"mechanic", "evidence"}))
+            route = replace(route, proof=replace(route.proof, subject_hash=route.subject_hash))
+            order = replace(order, role="evidence")
+            self.permit(runtime, route, order, prompt)
+            replacements = {
+                "id": "another-order",
+                "task_id": "another-task",
+                "repository": order.repository / "other-repository",
+                "base_sha": "f" * 40,
+                "branch": "fleet/another-branch",
+                "role": "mechanic",
+                "required_outcome": "a different outcome",
+                "path_claims": ("different-path",),
+                "semantic_claims": ("different/scope",),
+                "stop_conditions": ("a different stop",),
+                "witnesses": (("false",),),
+                "route_ids": (route.id, "another-route"),
+                "authority_files": ("different-law",),
+                "risk": "high",
+                "priority": 2,
+                "estimated_seconds": 2,
+                "estimated_tokens": 2,
+                "reviewer_family": "independent",
+                "issue": "issue-2",
+                "publish_branch": False,
+                "create_draft_pr": False,
+                "follow_remote_main": True,
+                "allow_no_change": True,
+            }
+            self.assertEqual(set(replacements), set(order.__dataclass_fields__))
+            for field, value in replacements.items():
+                with self.subTest(field=field):
+                    changed = replace(order, **{field: value})
+                    with mock.patch("fleet_control.runtime.subprocess.Popen", wraps=subprocess.Popen) as launch:
+                        with self.assertRaises(ExecutionBindingRefusal):
+                            runtime.execute(route=route, order=changed, prompt_path=prompt,
+                                            cwd=order.repository, attempt_permit=self.attempt_permit)
+                    launch.assert_not_called()
+                    self.assertFalse((order.repository / "provider-ran").exists())
+
+    def test_permit_refuses_an_independently_allowed_route_substitution(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script(
+            "import pathlib; pathlib.Path(__file__).with_name('provider-ran').write_text('ran')"
+        )
+        with temporary:
+            order = replace(order, route_ids=(route.id, "another-local"))
+            self.permit(runtime, route, order, prompt)
+            for changed in (
+                replace(route, id="another-local"),
+                replace(route, command=(*route.command, "changed-argv")),
+                replace(route, model="another-model"),
+                replace(route, timeout_seconds=route.timeout_seconds + 1),
+            ):
+                changed = replace(changed, proof=replace(changed.proof, subject_hash=changed.subject_hash))
+                with self.subTest(route=changed.id, command=changed.command, model=changed.model,
+                                  timeout_seconds=changed.timeout_seconds):
+                    with mock.patch("fleet_control.runtime.subprocess.Popen", wraps=subprocess.Popen) as launch:
+                        with self.assertRaises(ExecutionBindingRefusal):
+                            runtime.execute(route=changed, order=order, prompt_path=prompt,
+                                            cwd=order.repository, attempt_permit=self.attempt_permit)
+                    launch.assert_not_called()
+            self.assertFalse((order.repository / "provider-ran").exists())
+
+    def test_permit_refuses_a_changed_working_directory(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script("raise AssertionError('must not launch')")
+        with temporary:
+            other = order.repository / "other-worktree"
+            other.mkdir()
+            with mock.patch("fleet_control.runtime.subprocess.Popen", wraps=subprocess.Popen) as launch:
+                with self.assertRaises(ExecutionBindingRefusal):
+                    runtime.execute(route=route, order=order, prompt_path=prompt, cwd=other,
+                                    attempt_permit=self.attempt_permit)
+            launch.assert_not_called()
+
+    def test_subject_cannot_be_rebound_to_another_authenticated_attempt(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script("raise AssertionError('must not launch')")
+        with temporary:
+            with runtime.control.transition_permit("claim") as guard:
+                other = guard.issue_attempt_permit(
+                    "different-attempt", subject_hash=self.attempt_permit.subject_hash,
+                )
+            with mock.patch("fleet_control.runtime.subprocess.Popen", wraps=subprocess.Popen) as launch:
+                with self.assertRaises(ExecutionBindingRefusal):
+                    runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository,
+                                    attempt_permit=other)
+            launch.assert_not_called()
+
+    def test_changed_prompt_is_refused_inside_the_process_guard(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script("raise AssertionError('must not launch')")
+        with temporary:
+            transition = runtime.control.transition_permit
+            prompt.write_bytes(b"changed after admission")
+            inside_guard = False
+
+            @contextmanager
+            def track_guard(boundary, token):
+                nonlocal inside_guard
+                with transition(boundary, token):
+                    inside_guard = True
+                    try:
+                        yield
+                    finally:
+                        inside_guard = False
+
+            def verify_at_guard(**arguments):
+                self.assertTrue(inside_guard)
+                return execution_subject(**arguments)
+
+            with mock.patch.object(runtime.control, "transition_permit", side_effect=track_guard), \
+                 mock.patch("fleet_control.runtime.execution_subject", side_effect=verify_at_guard), \
+                 mock.patch("fleet_control.runtime.subprocess.Popen", wraps=subprocess.Popen) as launch:
+                with self.assertRaises(ExecutionBindingRefusal):
+                    runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository,
+                                    attempt_permit=self.attempt_permit)
+            launch.assert_not_called()
+            self.assertEqual(list(runtime.state_dir.glob("idol-fleet-prompt-*")), [])
+
+    def test_both_prompt_arguments_use_the_validated_snapshot(self) -> None:
+        temporary, runtime, route, order, prompt = self.execute_script(
+            "import json, pathlib, sys\n"
+            "print(json.dumps({'status':'ok','provider':'local','model':'test-model','costUsd':0,"
+            "'usage':{'file_hex':pathlib.Path(sys.argv[1]).read_bytes().hex(),'text':sys.argv[2]}}))\n"
+        )
+        with temporary:
+            content = "validated café\r\n$(inert)".encode("utf-8")
+            prompt.write_bytes(content)
+            route = replace(route, command=(*route.command, "{prompt}", "{prompt_text}"))
+            route = replace(route, proof=replace(route.proof, subject_hash=route.subject_hash))
+            self.permit(runtime, route, order, prompt)
+            popen = subprocess.Popen
+            snapshots = []
+
+            def change_original_before_launch(command, *args, **kwargs):
+                snapshot = Path(command[-2])
+                self.assertNotEqual(snapshot, prompt)
+                self.assertEqual(snapshot.read_bytes(), content)
+                self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
+                snapshots.append(snapshot)
+                prompt.write_bytes(b"changed after validation")
+                return popen(command, *args, **kwargs)
+
+            with mock.patch("fleet_control.runtime.subprocess.Popen", side_effect=change_original_before_launch):
+                result = runtime.execute(route=route, order=order, prompt_path=prompt,
+                                         cwd=order.repository, attempt_permit=self.attempt_permit)
+            self.assertEqual(result.usage["file_hex"], content.hex())
+            self.assertEqual(result.usage["text"], content.decode("utf-8"))
+            self.assertEqual(len(snapshots), 1)
+            self.assertFalse(snapshots[0].exists())
 
     def test_disabled_control_refuses_before_provider_process_creation(self) -> None:
         temporary, runtime, route, order, prompt = self.execute_script("raise AssertionError('must not launch')")
@@ -126,6 +292,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIsNotNone(children[0].poll())
             self.assertTrue(children[0].stdout.closed)
             self.assertTrue(children[0].stderr.closed)
+            self.assertEqual(list(runtime.state_dir.glob("idol-fleet-prompt-*")), [])
 
     def test_stdout_truncation_is_explicit(self) -> None:
         bounded, truncated = CommandRuntime._bounded_text("abcd", limit=3)
@@ -160,6 +327,7 @@ class RuntimeTests(unittest.TestCase):
         )
         route = replace(route, parser="openclaw-json")
         route = replace(route, proof=replace(route.proof, subject_hash=route.subject_hash))
+        self.permit(runtime, route, order, prompt)
         with temporary, self.assertRaises(RuntimeRefusal):
             runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository, attempt_permit=self.attempt_permit)
 
@@ -174,6 +342,7 @@ class RuntimeTests(unittest.TestCase):
             route = replace(route, command=(*route.command, "{prompt_text}"))
             route = replace(route, proof=replace(route.proof, subject_hash=route.subject_hash))
             order = replace(order, route_ids=(route.id,))
+            self.permit(runtime, route, order, prompt)
             result = runtime.execute(route=route, order=order, prompt_path=prompt, cwd=order.repository, attempt_permit=self.attempt_permit)
             self.assertEqual(result.usage["argument"], value)
             self.assertFalse(marker.exists())
@@ -207,13 +376,13 @@ class RuntimeTests(unittest.TestCase):
             # object only for this planted timeout control.
             route = replace(route, timeout_seconds=10)
             runtime = CommandRuntime(root / "state")
-            self.permit(runtime)
             order = self.order(root)
             with self.assertRaises(RuntimeRefusal):
                 # Patch the test command to exit through RuntimeRefusal without
                 # waiting for the full bound by using SIGALRM in the child.
                 fast = replace(route, command=("python3", "-c", "import time,signal; signal.alarm(1); time.sleep(30)"))
                 fast = replace(fast, proof=replace(fast.proof, subject_hash=fast.subject_hash))
+                self.permit(runtime, fast, order, prompt)
                 runtime.execute(route=fast, order=order, prompt_path=prompt, cwd=root, attempt_permit=self.attempt_permit)
 
 

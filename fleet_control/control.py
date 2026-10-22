@@ -21,7 +21,7 @@ from typing import Callable, Iterator, Mapping
 STATE_SCHEMA = "idol.fleet.control.v1"
 KEY_SCHEMA = "idol.fleet.control-key.v1"
 ANCHOR_SCHEMA = "idol.fleet.control-anchor.v1"
-TOKEN_SCHEMA = "idol.fleet.attempt-permit.v1"
+TOKEN_SCHEMA = "idol.fleet.attempt-permit.v2"
 
 STATE_FILE = "control-state.json"
 KEY_FILE = "control.key"
@@ -76,6 +76,7 @@ class ControlStatus:
 class AttemptPermit:
     schema: str
     attempt_id: str
+    subject_hash: str
     enable_epoch: str
     issued_generation: int
     issued_at: float
@@ -119,6 +120,14 @@ def _canonical(value: Mapping[str, object]) -> bytes:
         separators=(",", ":"),
         ensure_ascii=True,
     ).encode("utf-8")
+
+
+def _valid_subject_hash(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
 
 
 def _identity(value: os.stat_result) -> tuple[int, int]:
@@ -182,11 +191,13 @@ class _ClaimGuard:
     def close(self) -> None:
         self._active = False
 
-    def issue_attempt_permit(self, attempt_id: str) -> AttemptPermit:
+    def issue_attempt_permit(self, attempt_id: str, *, subject_hash: str) -> AttemptPermit:
         if not self._active:
             raise ControlRefusal("claim guard is no longer active")
         if not attempt_id or len(attempt_id) > 200 or any(ord(char) < 0x20 for char in attempt_id):
             raise ValueError("attempt id is invalid")
+        if not _valid_subject_hash(subject_hash):
+            raise ValueError("attempt subject hash must be a lowercase SHA-256 digest")
         if attempt_id in self._issued_ids:
             raise ControlRefusal("attempt permit was already issued")
         if self._state.enable_epoch is None or self._state.enable_expires_at is None:
@@ -202,6 +213,7 @@ class _ClaimGuard:
         payload: dict[str, object] = {
             "schema": TOKEN_SCHEMA,
             "attempt_id": attempt_id,
+            "subject_hash": subject_hash,
             "enable_epoch": self._state.enable_epoch,
             "issued_generation": self._state.generation,
             "issued_at": now,
@@ -212,6 +224,7 @@ class _ClaimGuard:
         return AttemptPermit(
             schema=TOKEN_SCHEMA,
             attempt_id=attempt_id,
+            subject_hash=subject_hash,
             enable_epoch=self._state.enable_epoch,
             issued_generation=self._state.generation,
             issued_at=now,
@@ -827,6 +840,7 @@ class LocalControl:
             raise ControlRefusal("attempt permit has invalid type")
         if (
             not token.attempt_id
+            or not _valid_subject_hash(token.subject_hash)
             or not self._valid_epoch(token.enable_epoch)
             or not isinstance(token.issued_generation, int)
             or isinstance(token.issued_generation, bool)
@@ -839,6 +853,7 @@ class LocalControl:
         payload: dict[str, object] = {
             "schema": token.schema,
             "attempt_id": token.attempt_id,
+            "subject_hash": token.subject_hash,
             "enable_epoch": token.enable_epoch,
             "issued_generation": token.issued_generation,
             "issued_at": token.issued_at,
