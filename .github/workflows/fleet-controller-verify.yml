@@ -10,6 +10,9 @@ on:
       - plugins/openclaw-fleet-snapshot/**
       - scripts/idol-fleet
       - scripts/idol-dev
+      - scripts/bootstrap.sh
+      - config/.shared-env.template
+      - scripts/discover-fleet-host.py
       - scripts/fleet_health_probe.py
       - scripts/fleet-systemd-recovery.sh
       - config/systemd/idol-health-probe.*
@@ -35,6 +38,9 @@ on:
       - plugins/openclaw-fleet-snapshot/**
       - scripts/idol-fleet
       - scripts/idol-dev
+      - scripts/bootstrap.sh
+      - config/.shared-env.template
+      - scripts/discover-fleet-host.py
       - scripts/fleet_health_probe.py
       - scripts/fleet-systemd-recovery.sh
       - config/systemd/idol-health-probe.*
@@ -84,8 +90,9 @@ jobs:
           node-version: "22"
       - name: Compile controller
         run: |
-          python3 -m compileall -q fleet_control tests scripts/fleet_health_probe.py scripts/codex_inventory.py scripts/openclaw_transport.py scripts/openclaw-inventory-adapter.py scripts/inventory_snapshot_lock.py
+          python3 -m compileall -q fleet_control tests scripts/discover-fleet-host.py scripts/fleet_health_probe.py scripts/codex_inventory.py scripts/openclaw_transport.py scripts/openclaw-inventory-adapter.py scripts/inventory_snapshot_lock.py
           sh -n scripts/idol-dev scripts/fleet-systemd-recovery.sh scripts/install-fleet-systemd.sh scripts/install-fleet-observer-systemd.sh
+          bash -n scripts/bootstrap.sh
       - name: Run fail-closed controller tests
         run: python3 -m unittest discover -s tests -v
       - name: Prove example routes are disabled and non-pay-go
