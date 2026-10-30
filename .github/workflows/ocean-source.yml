@@ -1,0 +1,39 @@
+name: Pinned public source for Ocean verification
+on:
+  push:
+    branches: [verify/ocean-source-20261030]
+    paths: [.github/workflows/ocean-source.yml]
+permissions:
+  contents: read
+jobs:
+  source:
+    if: github.actor == 'clpi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: 40cad7d9a45306d68265f145dfe698699620a4bb
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Emit only exact already-public tracked source
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, subprocess, zlib
+          def git(*args):
+              return subprocess.run(['git', *args], check=True, capture_output=True, timeout=30).stdout
+          revision = git('rev-parse', 'HEAD').decode().strip()
+          assert revision == '40cad7d9a45306d68265f145dfe698699620a4bb'
+          archive = git('archive', '--format=tar', 'HEAD')
+          commit = git('cat-file', 'commit', 'HEAD')
+          data = json.dumps({'revision': revision, 'commit': base64.b64encode(commit).decode(),
+                             'archive': base64.b64encode(archive).decode()}, separators=(',', ':')).encode()
+          packed = zlib.compress(data, 9)
+          assert len(packed) < 250000
+          encoded = base64.b64encode(packed).decode()
+          print('OCEAN_SOURCE_BEGIN', len(packed), hashlib.sha256(packed).hexdigest())
+          for index in range(0, len(encoded), 4000):
+              print('OCEAN_SOURCE_PART', index // 4000, encoded[index:index+4000])
+          print('OCEAN_SOURCE_END')
+          PY
