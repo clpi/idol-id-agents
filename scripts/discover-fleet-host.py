@@ -22,10 +22,13 @@ from typing import Any, Mapping, Sequence
 
 SECRET = re.compile(
     r"(?i)(bearer\s+[A-Za-z0-9._~+/=-]+|(?:sk-|gh[pousr]_|github_pat_|tskey-)[A-Za-z0-9_-]+"
-    r"|[A-Fa-f0-9]{48,}|[\w-]*(?:api[_-]?key|token|password|secret)[\w-]*[\"']?\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,\"'&}]+)"
-    r"|https?://[^\s/@]+:[^\s/@]+@[^\s]+)"
+    r"|[A-Fa-f0-9]{48,}|https?://[^\s/@]+:[^\s/@]+@[^\s]+)"
 )
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+ASSIGNMENT = re.compile(
+    r"(?<![\w-])(?P<key>[\w-]+)[\"']?\s*[=:]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,\"'&}]+)"
+)
+CREDENTIAL = re.compile(r"(?i)api[_-]?key|token|password|secret")
+EMAIL = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 COMMANDS = {
     "python3": (("--version",),),
     "git": (("--version",),),
@@ -68,7 +71,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def clean(text: str, *, limit: int = 1000) -> str:
-    value = SECRET.sub("[secret-redacted]", text)
+    value = ASSIGNMENT.sub(
+        lambda match: "[secret-redacted]" if CREDENTIAL.search(match["key"]) else match[0], text
+    )
+    value = SECRET.sub("[secret-redacted]", value)
     value = EMAIL.sub("[email-redacted]", value)
     home = str(Path.home())
     if home:
@@ -271,7 +277,7 @@ def json_object(text: str) -> Mapping[str, Any] | None:
             continue
         try:
             value = json.loads(candidate)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if isinstance(value, Mapping):
             return value
@@ -363,7 +369,7 @@ def ollama_fact() -> Mapping[str, Any]:
         return {"ok": True, "output_hash": hashlib.sha256(body).hexdigest(),
                 "models": sorted({row["name"] for row in inventory}), "inventory": inventory,
                 "source": "loopback-api-tags", "inference_verified": False}
-    except (OSError, http.client.HTTPException, UnicodeError, ValueError):
+    except (OSError, http.client.HTTPException, UnicodeError, ValueError, RecursionError):
         return {"ok": False, "reason": "local-metadata-unavailable-or-invalid"}
     finally:
         connection.close()
@@ -541,7 +547,7 @@ def tailscale_fact() -> Mapping[str, Any]:
                     self=peer(raw["Self"]),
                     peers=[peer(value) for value in peers.values()],
                     inventory_source="tailscale-status", compute_authorization="unverified")
-    except (UnicodeError, ValueError, TypeError):
+    except (UnicodeError, ValueError, TypeError, RecursionError):
         fact["reason"] = "status-unavailable-or-invalid"
     return fact
 
