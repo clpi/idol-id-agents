@@ -180,6 +180,48 @@ class ManagedFleetController(FleetController):
                 terminal_tasks.add(task_id)
         return attempts, frozenset(terminal_attempts), frozenset(terminal_tasks)
 
+    def retry(self, attempt: str, task: str) -> bool:
+        terminal = {
+            "attempt.ready", "attempt.refused", "attempt.failed", "attempt.cancelled",
+            "attempt.no-change", "attempt.admitted", "attempt.rejected", "attempt.reverted",
+        }
+        retryable = {"attempt.refused", "attempt.failed", "attempt.cancelled", "attempt.rejected"}
+        starts: dict[str, int] = {}
+        states: dict[str, str] = {}
+        unbound: list[int] = []
+        for index, row in enumerate(self.journal.events()):
+            kind = row.get("kind")
+            if kind != "attempt.started" and kind not in terminal:
+                continue
+            fact = row.get("fact")
+            if not isinstance(fact, Mapping):
+                continue
+            identity = fact.get("attempt_id")
+            if identity == attempt and fact.get("task_id") != task:
+                return False
+            if fact.get("task_id") != task:
+                continue
+            if not isinstance(identity, str) or not identity:
+                if kind == "attempt.refused" and fact.get("retryable_route_failure") is True:
+                    unbound.append(index)
+                    continue
+                return False
+            if kind == "attempt.started":
+                if identity in states:
+                    return False
+                starts[identity] = index
+            elif identity not in starts:
+                return False
+            states[identity] = str(kind)
+        if attempt not in starts or states.get(attempt) != "attempt.started":
+            return False
+        if any(index >= starts[attempt] for index in unbound):
+            return False
+        return all(
+            identity == attempt or (starts[identity] < starts[attempt] and kind in retryable)
+            for identity, kind in states.items()
+        )
+
     def reconcile_sessions(self, *, head: str, now: float) -> tuple[Mapping[str, Any], ...]:
         inventory = self.inventory_observation
         if inventory is None:
@@ -199,9 +241,9 @@ class ManagedFleetController(FleetController):
             if session.terminal:
                 continue
             adoption = adoptions.get(session.id)
-            controller_owned = bool(session.attempt_id and session.attempt_id in attempts)
+            owned = bool(session.attempt_id and session.attempt_id in attempts)
             adopted = bool(adoption and adoption.approved)
-            managed = controller_owned or adopted
+            managed = owned or adopted
             if not managed:
                 fact = {
                     "session_id": session.id,
@@ -215,12 +257,12 @@ class ManagedFleetController(FleetController):
                 continue
             expected_base = (
                 attempts.get(session.attempt_id or "", {}).get("base_sha")
-                if controller_owned
+                if owned
                 else adoption.base_sha if adoption else None
             )
-            expected_task = (
+            task = (
                 attempts.get(session.attempt_id or "", {}).get("task_id")
-                if controller_owned
+                if owned
                 else adoption.task_id if adoption else None
             )
             reasons: list[str] = []
@@ -230,16 +272,17 @@ class ManagedFleetController(FleetController):
                 reasons.append("session-base-stale")
             if session.attempt_id and session.attempt_id in terminal_attempts:
                 reasons.append("attempt-terminal")
-            if expected_task and expected_task in terminal_tasks:
-                reasons.append("task-terminal")
+            if task and task in terminal_tasks:
+                if not owned or not self.retry(session.attempt_id, task):
+                    reasons.append("task-terminal")
             if not reasons:
                 continue
             fact: dict[str, Any] = {
                 "session_id": session.id,
                 "attempt_id": session.attempt_id,
                 "order_id": session.order_id or (adoption.order_id if adoption else None),
-                "task_id": session.task_id or expected_task,
-                "managed_by": "controller" if controller_owned else "explicit-adoption",
+                "task_id": session.task_id or task,
+                "managed_by": "controller" if owned else "explicit-adoption",
                 "reasons": tuple(dict.fromkeys(reasons)),
             }
             if self.config.mode == "apply" and self.inventory_config.cancel_owned_sessions:
