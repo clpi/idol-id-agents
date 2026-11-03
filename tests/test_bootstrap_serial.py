@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -63,6 +64,15 @@ chmod +x "$HOME/.local/bin/$name"
         self.assertFalse((self.home/'.local/.idol-bootstrap-lock').exists())
         (self.home/'fail').unlink()
         self.assertEqual(self.run_bootstrap().returncode,0)
+    def test_minimal_path_needs_no_extra_directory_utilities(self):
+        (self.bin/'python3').symlink_to(sys.executable)
+        self.tool('claude', '#!/bin/sh\nexit 99\n')
+        self.tool('codex', '#!/bin/sh\nexit 99\n')
+        self.env['PATH'] = str(self.bin)
+        result = self.run_bootstrap()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home/'.local/.idol-bootstrap-lock').exists())
+        self.assertFalse((self.home/'install.log').exists())
     def test_existing_lock_is_preserved_and_npm_not_run(self):
         lock=self.home/'.local/.idol-bootstrap-lock';lock.mkdir(parents=True)
         (self.home/'release').touch()

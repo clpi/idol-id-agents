@@ -12,7 +12,7 @@ cleanup() {
     rm -f -- "$temporary_template"
   fi
   if [ -n "$bootstrap_lock" ]; then
-    rmdir -- "$bootstrap_lock" 2>/dev/null || true
+    python3 -c 'import os, sys; os.rmdir(sys.argv[1])' "$bootstrap_lock" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -152,8 +152,14 @@ main() {
   export PATH="$prefix/bin:$PATH"
   umask 077
   install_dependencies "$platform"
-  mkdir -p -- "$prefix"
-  if ! mkdir -- "$prefix/.idol-bootstrap-lock" 2>/dev/null; then
+  if ! python3 - "$prefix" <<'PYLOCK'
+import os
+import sys
+
+os.makedirs(sys.argv[1], mode=0o700, exist_ok=True)
+os.mkdir(os.path.join(sys.argv[1], ".idol-bootstrap-lock"), mode=0o700)
+PYLOCK
+  then
     fail "Another bootstrap owns $prefix, or its lock needs operator inspection."
   fi
   bootstrap_lock="$prefix/.idol-bootstrap-lock"
