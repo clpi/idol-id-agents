@@ -2,6 +2,70 @@
 
 The fleet controller is the temporary operational adapter for continuous IDOL and LIVE development. LIVE owns collaboration truth; this repository hosts the deletable bootstrap that observes current tools, proposes work, and—only after calibration—dispatches bounded attempts.
 
+## Host discovery
+
+Run the existing discovery adapter on each host whose local state you can inspect:
+
+```sh
+python3 scripts/discover-fleet-host.py \
+  --output /absolute/private/host.json \
+  --receipt /absolute/private/receipt.json \
+  --repository /absolute/path/to/checkout \
+  --storage-path /absolute/path/to/model-drive
+```
+
+The extra repository and storage arguments are repeatable. Discovery includes
+the declared `~/work/idol-main` and `~/hermes-jobs/idol-live` checkouts and keeps
+the earlier candidate paths. It records existing Git facts and deduplicates
+resolved paths. A directory name does not establish repository identity; the
+receipt's Idol flag comes from the observed GitHub origin. Discovery does not
+fetch, create checkouts, mount a drive, install a harness, or change a route.
+Unresolvable or inaccessible repository candidates are skipped independently,
+so a broken symlink cannot abort discovery of the remaining checkouts.
+
+Claim-helper discovery records the file's presence and SHA-256 without executing
+it, including with `--help`. Both output and receipt mark this observation
+`inspection_only: true` and `compatibility_verified: false`; legacy help fields
+remain unknown and the verb list is empty. Neither the repository origin nor a
+matching filename proves that the helper implements the controller's claim
+protocol. That compatibility still requires separate admission before execution.
+
+The existing `idol.fleet.host-discovery.v1` output now also carries:
+
+- Reported logical CPU count and physical memory where the host exposes it.
+  Linux CPU affinity is separate; physical memory is not a container allocation
+  or a promise of model capacity. GPU capability is not inferred from a name.
+- Existing filesystem capacity/free space for the requested paths, common model
+  caches, and `/Volumes/d 1`. Missing paths remain absent without substituting
+  their parent filesystem's capacity. Environment cache paths are observations,
+  not proof that a model server uses that location.
+- Tailscale's backend state and allowlisted self/peer metadata from
+  `tailscale status --json`. `online_reported` is the daemon's observation, not
+  reachability or compute authorization. Only the separate bounded `r16` ping
+  supports the legacy `r16_reachable` probe result. No SSH or remote job runs.
+- Installed harness/tool version observations and Hermes' declared provider,
+  model, auxiliary/delegation route and MCP names. Auth stores, credential values,
+  endpoint URLs, MCP arguments and environment values are not serialized.
+  Configuration presence does not prove authentication or tool availability.
+- Ollama catalog names, exact digests, byte sizes and available model details
+  from `GET http://127.0.0.1:11434/api/tags`. This fixed loopback request uses no
+  proxy, redirects, generation, model loading or downloads. A catalog entry can
+  refer to a cloud model and is never a billing or execution proof.
+
+Malformed or unavailable metadata is explicit failure/unknown, not a successful
+empty inventory. Model and peer lists have a 512-record limit; an oversized list
+refuses rather than claiming completeness. Configuration name projections are
+bounded to 512 entries. The public receipt retains counts and hashes instead of
+host/peer names, repository paths and model names; the detailed output remains
+mode 0600. Both retain the existing no-inference and no-PAYG observation flags.
+The controller's calibrated route, allowance, claim and native admission checks
+still decide whether any work can execute.
+
+Focused controls: `python3 -m unittest discover -s tests -p test_discover_fleet_host.py -v`.
+Metadata interfaces: [Tailscale CLI](https://tailscale.com/docs/reference/tailscale-cli),
+[Ollama catalog](https://docs.ollama.com/api/tags),
+[Hermes provider configuration](https://hermes-agent.nousresearch.com/docs/integrations/providers).
+
 ## Authority
 
 The controller never defines IDOL semantics. Every work order binds an exact repository SHA and names the authority files it must read. The prompt carries hashes and byte sizes rather than duplicating full authority files; the agent reads the files directly from its exact-SHA worktree. For `clpi/idol`, the default chain is:
