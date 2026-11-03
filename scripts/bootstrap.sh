@@ -5,10 +5,14 @@ set -euo pipefail
 template_revision=4cb500f1ac17eb358723bf495c3748ea03d4593c
 template_sha256=e043e3bc81171ff908d7670cd5e278f1481af5627986d258aca153410bfb6d24
 temporary_template=
+bootstrap_lock=
 
 cleanup() {
   if [ -n "$temporary_template" ]; then
     rm -f -- "$temporary_template"
+  fi
+  if [ -n "$bootstrap_lock" ]; then
+    rmdir -- "$bootstrap_lock" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -148,6 +152,11 @@ main() {
   export PATH="$prefix/bin:$PATH"
   umask 077
   install_dependencies "$platform"
+  mkdir -p -- "$prefix"
+  if ! mkdir -- "$prefix/.idol-bootstrap-lock" 2>/dev/null; then
+    fail "Another bootstrap owns $prefix, or its lock needs operator inspection."
+  fi
+  bootstrap_lock="$prefix/.idol-bootstrap-lock"
   prepare_environment
   install_agent claude @anthropic-ai/claude-code "$prefix"
   install_agent codex @openai/codex "$prefix"

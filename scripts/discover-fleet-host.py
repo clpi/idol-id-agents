@@ -44,6 +44,12 @@ COMMANDS = {
     "op": (("--version",),),
     "llama-cli": (("--version",),),
     "llama-server": (("--version",),),
+    # Presence-only until each optional CLI's version contract is verified.
+    "grok": (),
+    "poolside": (),
+    "agy": (),
+    "omp": (),
+    "oh-my-pi": (),
 }
 MAX_METADATA = 2_000_000
 MAX_RECORDS = 512
@@ -116,19 +122,19 @@ def run(arguments: Sequence[str], *, cwd: Path | None = None, timeout: int = 30)
         }
 
 
-def atomic_json(path: Path, value: Mapping[str, Any], mode: int) -> None:
+def atomic_json(path: Path, value: Mapping[str, Any], mode: int) -> str:
+    body = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("utf-8")
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
     try:
         os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, sort_keys=True, indent=2)
-            handle.write("\n")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        os.chmod(path, mode)
+        return hashlib.sha256(body).hexdigest()
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -137,6 +143,9 @@ def command_fact(name: str) -> Mapping[str, Any]:
     path = shutil.which(name)
     if not path:
         return {"found": False}
+    if not COMMANDS[name]:
+        return {"found": True, "path": path, "version_ok": False,
+                "version_hash": None, "version": None, "inspection_only": True}
     selected = None
     for suffix in COMMANDS[name]:
         probe = run((path, *suffix), timeout=15)
@@ -158,10 +167,20 @@ def command_fact(name: str) -> Mapping[str, Any]:
 def repo_fact(path: Path) -> Mapping[str, Any] | None:
     if not (path / ".git").exists():
         return None
-    head = run(("git", "rev-parse", "HEAD"), cwd=path)
-    branch = run(("git", "branch", "--show-current"), cwd=path)
-    dirty = run(("git", "status", "--porcelain=v1", "--untracked-files=no"), cwd=path)
-    remote = run(("git", "remote", "get-url", "origin"), cwd=path)
+    command = ("git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+               "-c", "core.hooksPath=/dev/null")
+    probes = (("rev-parse", "HEAD"), ("branch", "--show-current"),
+              ("status", "--porcelain=v1", "--untracked-files=no"),
+              ("remote", "get-url", "origin"))
+    first = [run((*command, *probe), cwd=path) for probe in probes]
+    second = [run((*command, *probe), cwd=path) for probe in probes]
+    stable = all((left["ok"], left["output"]) == (right["ok"], right["output"])
+                 for left, right in zip(first, second))
+    if not stable:
+        return {"path": str(path.resolve()), "head": None, "branch": None,
+                "tracked_dirty": None, "origin_hash": None, "origin_repository": None,
+                "observation_stable": False, "reason": "repository-changed-during-observation"}
+    head, branch, dirty, remote = first
     origin = re.fullmatch(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
                           r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?", remote["output"].strip()) if remote["ok"] else None
     return {
@@ -171,6 +190,7 @@ def repo_fact(path: Path) -> Mapping[str, Any] | None:
         "tracked_dirty": bool(dirty["output"].strip()) if dirty["ok"] else None,
         "origin_hash": remote["output_hash"] if remote["ok"] else None,
         "origin_repository": origin[1].lower() if origin else None,
+        "observation_stable": True,
     }
 
 
@@ -394,6 +414,7 @@ def storage_fact(additional: Sequence[Path] = ()) -> list[Mapping[str, Any]]:
         except FileNotFoundError:
             fact["exists"] = False
         except OSError:
+            fact["exists"] = None
             fact["reason"] = "unavailable"
         facts.append(fact)
     return facts
@@ -414,11 +435,31 @@ def hermes_fact() -> Mapping[str, Any]:
             return {"ok": False, "reason": "configuration-invalid"}
     except FileNotFoundError:
         return {"ok": False, "reason": "configuration-absent"}
-    except (OSError, UnicodeError, ValueError, ImportError):
+    except ImportError:
+        return {"ok": False, "reason": "yaml-dependency-unavailable"}
+    except (OSError, UnicodeError, ValueError):
         return {"ok": False, "reason": "configuration-unavailable"}
     except Exception:
         # YAML diagnostics may quote an entire secret-bearing source line.
         return {"ok": False, "reason": "configuration-invalid"}
+
+    # Validate only the projections we expose; this is not Hermes schema admission.
+    for key, expected in (("model", dict), ("providers", dict), ("fallback_providers", list),
+                          ("auxiliary", dict), ("delegation", dict), ("mcp_servers", dict)):
+        value = config.get(key)
+        if value is not None and (not isinstance(value, expected) or len(value) > MAX_RECORDS):
+            return {"ok": False, "reason": "configuration-projection-invalid"}
+    routes = [config.get("model", {}), config.get("delegation", {})]
+    routes += config.get("fallback_providers") or []
+    routes += list((config.get("auxiliary") or {}).values())
+    for value in routes:
+        if value is None:
+            continue
+        if not isinstance(value, dict) or any(
+            key in value and value[key] is not None and not isinstance(value[key], str)
+            for key in ("provider", "model", "default", "default_model")
+        ):
+            return {"ok": False, "reason": "configuration-projection-invalid"}
 
     def route(value: Any) -> Mapping[str, Any]:
         if not isinstance(value, dict):
@@ -474,7 +515,7 @@ def tailscale_fact() -> Mapping[str, Any]:
     try:
         raw = json.loads(status["output"]) if status["ok"] else None
         if (not isinstance(raw, dict) or not isinstance(raw.get("BackendState"), str)
-                or "Self" not in raw or "Peer" not in raw):
+                or not isinstance(raw.get("Self"), dict) or "Peer" not in raw):
             raise ValueError("invalid status")
         peers = raw.get("Peer")
         if peers is None:
@@ -497,7 +538,7 @@ def tailscale_fact() -> Mapping[str, Any]:
             return row
 
         fact.update(status_ok=True, backend_state=clean(raw["BackendState"], limit=120),
-                    self=peer(raw["Self"]) if raw.get("Self") is not None else None,
+                    self=peer(raw["Self"]),
                     peers=[peer(value) for value in peers.values()],
                     inventory_source="tailscale-status", compute_authorization="unverified")
     except (UnicodeError, ValueError, TypeError):
@@ -567,10 +608,11 @@ def main() -> int:
         "model_inference": False,
         "paygo_usage": False,
     }
-    atomic_json(args.output, full, 0o600)
+    observation_sha256 = atomic_json(args.output, full, 0o600)
 
     receipt = {
         "schema": "idol.fleet.host-discovery-receipt.v1",
+        "observation_sha256": observation_sha256,
         "subject": full["controller"]["head"],
         "observed_at": observed_at,
         "host": {
@@ -618,7 +660,11 @@ def main() -> int:
         "ollama": {
             "ok": full["ollama"].get("ok", False),
             "model_count": len(full["ollama"].get("models", [])) if full["ollama"].get("ok") else None,
-            "models_hash": digest(json.dumps(full["ollama"].get("models", []), sort_keys=True)),
+            "models_hash": digest(json.dumps(full["ollama"]["models"], sort_keys=True))
+            if full["ollama"].get("ok") else None,
+            "inventory_hash": digest(json.dumps(sorted(full["ollama"]["inventory"],
+                                     key=lambda row: (row["name"], row["digest"])), sort_keys=True))
+            if full["ollama"].get("ok") else None,
         },
         "launchd": full["launchd"],
         "tailscale": {
